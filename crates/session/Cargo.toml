@@ -16,3 +16,7 @@ librespot-oauth.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+nocturne-sink = { path = "../sink" }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

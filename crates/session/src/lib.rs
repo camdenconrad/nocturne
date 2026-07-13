@@ -2,6 +2,7 @@
 //! The UI talks to this through `NocturneHandle` — it never touches librespot types.
 
 use librespot_core::authentication::Credentials;
+use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
 use librespot_core::session::Session;
 use librespot_core::{SpotifyId, SpotifyUri};
@@ -37,6 +38,14 @@ fn client_id() -> Result<String, SessionError> {
     ))
 }
 
+fn dirs_cache() -> std::path::PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").expect("HOME unset")).join(".cache")
+        })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("oauth flow failed: {0}")]
@@ -52,25 +61,37 @@ pub struct NocturneHandle {
 }
 
 impl NocturneHandle {
-    /// Runs the OAuth flow (opens browser via portal), connects the session,
-    /// and builds a Player wired to the given sink.
+    /// Connects the session and builds a Player wired to the given sink.
+    ///
+    /// Credentials are cached under `~/.cache/nocturne`, so the browser consent screen appears
+    /// once and every later start reuses the stored credential — `connect(.., true)` is what
+    /// writes it back. Audio files are deliberately *not* cached (offline is out of scope).
     pub async fn login(
         make_sink: impl FnMut() -> Box<dyn librespot_playback::audio_backend::Sink> + Send + 'static,
     ) -> Result<Self, SessionError> {
-        let client_id = client_id()?;
-        let token = librespot_oauth::OAuthClientBuilder::new(
-            &client_id,
-            "http://127.0.0.1:8898/login",
-            OAUTH_SCOPES.to_vec(),
-        )
-        .open_in_browser()
-        .build()
-        .map_err(|e| SessionError::OAuth(e.to_string()))?
-        .get_access_token()
-        .map_err(|e| SessionError::OAuth(e.to_string()))?;
-        let credentials = Credentials::with_access_token(token.access_token);
+        let cache_dir = dirs_cache().join("nocturne");
+        let cache = Cache::new(Some(&cache_dir), Some(&cache_dir), None, None)
+            .map_err(|e| SessionError::Connect(e.to_string()))?;
 
-        let session = Session::new(SessionConfig::default(), None);
+        let credentials = match cache.credentials() {
+            Some(creds) => creds,
+            None => {
+                let client_id = client_id()?;
+                let token = librespot_oauth::OAuthClientBuilder::new(
+                    &client_id,
+                    "http://127.0.0.1:8898/login",
+                    OAUTH_SCOPES.to_vec(),
+                )
+                .open_in_browser()
+                .build()
+                .map_err(|e| SessionError::OAuth(e.to_string()))?
+                .get_access_token()
+                .map_err(|e| SessionError::OAuth(e.to_string()))?;
+                Credentials::with_access_token(token.access_token)
+            }
+        };
+
+        let session = Session::new(SessionConfig::default(), Some(cache));
         session
             .connect(credentials, true)
             .await
@@ -89,8 +110,16 @@ impl NocturneHandle {
     }
 
     pub fn play(&self, track: SpotifyId) {
-        self.player
-            .load(SpotifyUri::Track { id: track }, true, 0);
+        self.play_uri(SpotifyUri::Track { id: track });
+    }
+
+    pub fn play_uri(&self, uri: SpotifyUri) {
+        self.player.load(uri, true, 0);
+    }
+
+    /// Track/position/state changes, for the UI's now-playing bar.
+    pub fn player_events(&self) -> librespot_playback::player::PlayerEventChannel {
+        self.player.get_player_event_channel()
     }
 
     pub fn pause(&self) {
