@@ -1,53 +1,52 @@
-//! Runic-native sink: implements librespot's `Sink` against the audio daemon Rune runs.
+//! Audio out for Nocturne — straight into runic, no PipeWire daemon in the path.
 //!
-//! Runic exposes the PipeWire native protocol (that's what its M3 responder answers),
-//! so this crate talks to that socket. When runic grows a first-party client crate,
-//! only this crate changes — nothing above the `Sink` boundary moves.
+//! The obvious-looking approach is to hand-roll a `Sink` that speaks runic's wire protocol. Don't:
+//! runic already *is* the PulseAudio server (runic-m3 owns `$XDG_RUNTIME_DIR/pulse/native` as well
+//! as `pipewire-0`), so librespot's stock `pulseaudio-backend` lands in runic with no protocol code
+//! of our own and none of the resampling/format-negotiation bugs a fresh implementation would earn.
+//! "Runic-native" is satisfied by *runic being the server*, not by inventing a private transport.
+//!
+//! Rate: runic's mixer bus is 48 kHz and it band-limit-resamples per stream, so handing it
+//! librespot's native 44.1 kHz is correct — do not pre-convert here and stack two resamplers.
 
-use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
-use librespot_playback::convert::Converter;
-use librespot_playback::decoder::AudioPacket;
+use librespot_playback::audio_backend::{self, Sink, SinkBuilder};
+use librespot_playback::config::AudioFormat;
 
-pub struct RunicSink {
-    open: bool,
+/// PulseAudio-protocol name librespot connects to. Empty string = "the default server", which
+/// resolves through `$PULSE_SERVER` / `$XDG_RUNTIME_DIR/pulse/native` — i.e. runic.
+const DEFAULT_DEVICE: Option<String> = None;
+
+/// librespot's `S16` is the format runic's pulse path is happiest with; `F32` is accepted too but
+/// buys nothing here since the source is already lossy.
+pub const FORMAT: AudioFormat = AudioFormat::S16;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SinkError {
+    #[error("librespot has no pulseaudio backend compiled in — check the `pulseaudio-backend` feature")]
+    BackendMissing,
 }
 
-impl RunicSink {
-    pub fn new() -> Self {
-        Self { open: false }
+/// librespot's pulse backend reads its stream naming out of the environment and defaults to a bare
+/// "stream", which is what shows up in the mixer next to every other app. Name it before the first
+/// sink is built, or Nocturne is an anonymous row in rmix.
+fn name_stream() {
+    if std::env::var_os("PULSE_PROP_application.name").is_none() {
+        std::env::set_var("PULSE_PROP_application.name", "Nocturne");
+    }
+    if std::env::var_os("PULSE_PROP_stream.description").is_none() {
+        std::env::set_var("PULSE_PROP_stream.description", "Nocturne");
     }
 }
 
-impl Default for RunicSink {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Build the sink factory the `Player` wants. Fails loudly at startup rather than silently
+/// falling back to a different audio path — Nocturne is runic-only by design.
+pub fn runic_sink_builder() -> Result<SinkBuilder, SinkError> {
+    name_stream();
+    audio_backend::find(Some("pulseaudio".to_string())).ok_or(SinkError::BackendMissing)
 }
 
-impl Sink for RunicSink {
-    fn start(&mut self) -> SinkResult<()> {
-        // TODO(M1): connect to $XDG_RUNTIME_DIR/pipewire-0 (served by runic),
-        // negotiate a 44.1kHz/f32 stream node.
-        self.open = true;
-        tracing::info!("RunicSink started");
-        Ok(())
-    }
-
-    fn stop(&mut self) -> SinkResult<()> {
-        self.open = false;
-        tracing::info!("RunicSink stopped");
-        Ok(())
-    }
-
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
-        if !self.open {
-            return Err(SinkError::NotConnected("RunicSink not started".into()));
-        }
-        let samples = packet
-            .samples()
-            .map_err(|e| SinkError::OnWrite(e.to_string()))?;
-        // TODO(M1): hand the converted frames to the stream node instead of dropping them.
-        let _pcm = converter.f64_to_f32(samples);
-        Ok(())
-    }
+/// Convenience: the closure `Player::new` takes.
+pub fn make_sink() -> Result<impl FnMut() -> Box<dyn Sink> + Send + 'static, SinkError> {
+    let builder = runic_sink_builder()?;
+    Ok(move || builder(DEFAULT_DEVICE.clone(), FORMAT))
 }

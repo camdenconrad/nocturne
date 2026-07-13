@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Runic-native audio sink for Nocturne: librespot Sink impl speaking the protocol runic serves."
+description = "Audio sink for Nocturne: librespot's PulseAudio backend pointed at runic's native socket."
 
 [dependencies]
+# pulseaudio-backend (set on the workspace dep), NOT rodio/alsa: runic serves the PulseAudio
+# protocol directly (runic-m3 owns $XDG_RUNTIME_DIR/pulse/native), so it IS the runic-native path.
 librespot-playback.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
