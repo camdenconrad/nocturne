@@ -42,6 +42,10 @@ pub enum Cmd {
     Resume,
     /// Show the list the currently-playing queue came from.
     ShowPlayingList,
+    /// Open the current temp radio playlist.
+    ShowRadioPlaylist,
+    /// Persist the temp radio playlist to Spotify as a real playlist.
+    SaveRadioToSpotify,
     /// Add a track to a playlist. Local: Spotify 403s playlist writes for restricted apps too.
     AddToPlaylist(String, Track),
 }
@@ -99,6 +103,9 @@ pub struct State {
     /// The live queue and where we are in it — drives Up Next / History panels.
     pub queue: Vec<Track>,
     pub qpos: usize,
+    /// The current auto-generated radio playlist: a real, named list that lives only on this disk
+    /// until the next radio replaces it. `None` until a radio has been built.
+    pub radio_playlist: Option<RadioPlaylist>,
     /// The name of the list the QUEUE came from — which is not the same as `view`, because you can
     /// be browsing one playlist while a different one is playing. The back arrow uses this.
     pub queue_view: String,
@@ -132,6 +139,7 @@ impl Default for State {
             queue: Vec::new(),
             qpos: 0,
             queue_view: String::new(),
+            radio_playlist: None,
             liked: Default::default(),
             art: Default::default(),
         }
@@ -183,6 +191,10 @@ async fn run(
         Taste::load(&cache::model_path()).unwrap_or_default(),
     ));
     let mut backfilling = false;
+    // The last radio survives a restart — it's a playlist, not a transient.
+    if let Some(pl) = cache::list_get::<RadioPlaylist>("radio-playlist") {
+        state.lock().unwrap().radio_playlist = Some(pl);
+    }
     // A restored session shows a track but has NOT loaded it into the player. The first play must
     // load it (and seek), not just un-pause. Inferring this from `resume_at > 0` was the bug that
     // made a resumed track silent whenever it was restored at 0:00 — pressing play un-paused a
@@ -693,11 +705,25 @@ async fn run(
 
                     let n = queue_tracks.len();
                     let fresh = queue_tracks.iter().filter(|t| !owned.contains(&t.uri)).count();
-                    tracing::info!("mood “{phrase}” → {n} tracks ({fresh} new to him)");
+                    let name = radio_name(&phrase);
+                    tracing::info!("mood “{phrase}” → “{name}”: {n} tracks ({fresh} new)");
+
+                    // The radio IS a playlist: named, saved to disk, and kept until the next one
+                    // replaces it.
+                    let pl = RadioPlaylist {
+                        name: name.clone(),
+                        phrase: phrase.clone(),
+                        tracks: queue_tracks.clone(),
+                        spotify_id: None,
+                    };
+                    cache::list_put("radio-playlist", &pl);
+
                     set(&st, &rp, |s| {
                         s.busy = false;
                         s.status = format!("{n} tracks · {fresh} new");
                         s.tracks = queue_tracks.clone();
+                        s.view = name.clone();
+                        s.radio_playlist = Some(pl);
                     });
                     let _ = tx2.send(Cmd::PlayQueue(queue_tracks));
                 });
@@ -782,9 +808,11 @@ async fn run(
                 set(&state, &repaint, |s| {
                     s.queue = sess.queue.clone();
                     s.qpos = sess.qpos;
-                    s.view = sess.view.clone();
+                    // Restore the QUEUE, not the browsed list. Setting `tracks` here overwrote the
+                    // visible list with the queue while keeping the old view's name — which is how
+                    // "Liked Songs" ended up showing 56 tracks instead of 2197. What you're
+                    // browsing and what's playing are different things; the chevron bridges them.
                     s.queue_view = sess.view.clone();
-                    s.tracks = sess.queue.clone();
                     s.current_uri = Some(t.uri.clone());
                     s.now = Some(NowPlaying {
                         name: t.name.clone(),
@@ -846,6 +874,60 @@ async fn run(
                         s.tracks = s.queue.clone();
                         s.view = s.queue_view.clone();
                         s.status = format!("{} tracks", s.queue.len());
+                    }
+                });
+            }
+
+            Cmd::ShowRadioPlaylist => {
+                set(&state, &repaint, |s| {
+                    if let Some(pl) = s.radio_playlist.clone() {
+                        s.tracks = pl.tracks;
+                        s.view = pl.name;
+                        s.status = format!("{} tracks", s.tracks.len());
+                    }
+                });
+            }
+
+            Cmd::SaveRadioToSpotify => {
+                let Some(pl) = state.lock().unwrap().radio_playlist.clone() else {
+                    continue;
+                };
+                if pl.spotify_id.is_some() {
+                    set(&state, &repaint, |s| {
+                        s.status = format!("“{}” is already on Spotify", pl.name)
+                    });
+                    continue;
+                }
+                let (h, st, rp) = (handle.clone(), state.clone(), repaint.clone());
+                tokio::spawn(async move {
+                    let Some(api) = api(&h, &st, &rp).await else { return };
+                    busy(&st, &rp, format!("saving “{}” to Spotify…", pl.name));
+                    let uris: Vec<String> = pl.tracks.iter().map(|t| t.uri.clone()).collect();
+                    match api.create_playlist(&pl.name, &uris).await {
+                        Ok(id) => {
+                            tracing::info!("saved “{}” to Spotify as {id}", pl.name);
+                            let mut saved = pl.clone();
+                            saved.spotify_id = Some(id);
+                            cache::list_put("radio-playlist", &saved);
+                            set(&st, &rp, |s| {
+                                s.busy = false;
+                                s.status = format!("“{}” saved to Spotify", saved.name);
+                                s.radio_playlist = Some(saved);
+                            });
+                            // It's a real playlist now — pull the list again so it appears.
+                            let _ = api.playlists(500).await.map(|p| {
+                                cache::list_put("playlists", &p);
+                                set(&st, &rp, |s| s.playlists = p);
+                            });
+                        }
+                        Err(e) => {
+                            // Honest: the local copy is untouched and still works.
+                            fail(
+                                &st,
+                                &rp,
+                                format!("Spotify refused the playlist ({e}) — kept locally"),
+                            );
+                        }
                     }
                 });
             }
@@ -1193,6 +1275,37 @@ fn set_big(state: &Shared, uri: &str, big: &str) {
         if let Some(n) = &mut s.now {
             n.art_big = Some(big.to_string());
         }
+    }
+}
+
+/// An auto-generated radio, saved as a playlist on this disk only.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RadioPlaylist {
+    pub name: String,
+    pub phrase: String,
+    pub tracks: Vec<Track>,
+    /// Set once it has been pushed to Spotify as a real playlist.
+    #[serde(default)]
+    pub spotify_id: Option<String>,
+}
+
+/// Turn "chill autumn lofi cozy" into "Chill Autumn Lofi Cozy" — a name that looks like something a
+/// human would have typed, not a slug.
+fn radio_name(phrase: &str) -> String {
+    let words: Vec<String> = phrase
+        .split_whitespace()
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        "Radio".to_string()
+    } else {
+        words.join(" ")
     }
 }
 

@@ -250,6 +250,66 @@ impl Client {
             .collect())
     }
 
+    /// Create a real Spotify playlist and fill it.
+    ///
+    /// Untested against a live account: Spotify has us rate-limited for ~21h as I write this, and
+    /// library writes (`PUT /me/tracks`) are 403 for restricted apps — playlist writes may well be
+    /// too. So this reports its failure honestly instead of pretending; the local copy is always
+    /// kept regardless.
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        uris: &[String],
+    ) -> Result<String, ApiError> {
+        let me: serde_json::Value = self.get(&format!("{API}/me")).await?;
+        let uid = me["id"].as_str().unwrap_or_default().to_string();
+        if uid.is_empty() {
+            return Err(ApiError::Status {
+                status: 0,
+                body: "could not resolve user id".into(),
+            });
+        }
+
+        let resp = self
+            .http
+            .post(format!("{API}/users/{uid}/playlists"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "name": name,
+                "public": false,
+                "description": "Created by Nocturne",
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ApiError::Status {
+                status: status.as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+        let created: serde_json::Value = resp.json().await?;
+        let pid = created["id"].as_str().unwrap_or_default().to_string();
+
+        // Spotify takes 100 uris per request.
+        for chunk in uris.chunks(100) {
+            let r = self
+                .http
+                .post(format!("{API}/playlists/{pid}/tracks"))
+                .bearer_auth(&self.token)
+                .json(&serde_json::json!({ "uris": chunk }))
+                .send()
+                .await?;
+            if !r.status().is_success() {
+                return Err(ApiError::Status {
+                    status: r.status().as_u16(),
+                    body: r.text().await.unwrap_or_default(),
+                });
+            }
+        }
+        Ok(pid)
+    }
+
     /// Raw image bytes for a cover URL (art lives on a CDN, not the API host).
     pub async fn fetch_art(&self, url: &str) -> Result<Vec<u8>, ApiError> {
         let resp = self.http.get(url).send().await?;

@@ -414,28 +414,7 @@ impl App {
             )
             .show(ctx, |ui| {
                 let view = self.state.lock().unwrap().view.clone();
-                // A back arrow to whatever is CURRENTLY PLAYING — not the list you happen to be
-                // looking at. Only offered when something is actually queued.
-                let playing_list = {
-                    let s = self.state.lock().unwrap();
-                    (!s.queue.is_empty()).then(|| s.queue_view.clone())
-                };
                 ui.horizontal(|ui| {
-                    if let Some(name) = &playing_list {
-                        let hint = if name.is_empty() {
-                            "Back to what's playing".to_string()
-                        } else {
-                            format!("Back to “{name}”")
-                        };
-                        if icons::button(ui, Icon::ChevronLeft, 24.0, false)
-                            .on_hover_text(hint)
-                            .clicked()
-                        {
-                            self.send(Cmd::ShowPlayingList);
-                            self.vibe = false;
-                            self.show_sidebar = false;
-                        }
-                    }
                     ui.label(RichText::new("LIBRARY").weak().small());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icons::button(ui, Icon::Close, 22.0, false)
@@ -455,6 +434,21 @@ impl App {
                     self.vibe = false;
                     self.show_sidebar = false;
                 }
+                // The current radio, as a first-class list. It lives on this disk and survives
+                // restarts; a new radio replaces it.
+                let radio = self.state.lock().unwrap().radio_playlist.clone();
+                if let Some(pl) = radio {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("RADIO").weak().small());
+                    ui.add_space(4.0);
+                    let active = view == pl.name;
+                    if nav_item(ui, &pl.name, active, Some(Icon::Radio)) {
+                        self.send(Cmd::ShowRadioPlaylist);
+                        self.vibe = false;
+                        self.show_sidebar = false;
+                    }
+                }
+
                 ui.add_space(14.0);
                 ui.label(RichText::new("PLAYLISTS").weak().small());
                 ui.add_space(6.0);
@@ -685,6 +679,8 @@ impl App {
                     let go = m.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if (go || labeled_button(ui, Icon::Radio, "Radio")) && !self.mood.trim().is_empty() {
                         self.send(Cmd::MoodRadio(self.mood.clone()));
+                        // Land in the new playlist so you can see what it built.
+                        self.vibe = false;
                     }
                     ui.add_space(4.0);
                     // Each mood gets an accent dot in a colour that means something: warm amber for
@@ -700,6 +696,7 @@ impl App {
                         if chip(ui, label, accent) {
                             self.mood = phrase.to_string();
                             self.send(Cmd::MoodRadio(phrase.to_string()));
+                            self.vibe = false;
                         }
                     }
                 });
@@ -714,6 +711,28 @@ impl App {
                         if !tracks.is_empty() && labeled_button(ui, Icon::Play, "Play all") {
                             self.send(Cmd::PlayQueue(tracks.clone()));
                             self.vibe = true;
+                        }
+
+                        // Viewing the temp radio? Offer to make it permanent.
+                        let radio = self.state.lock().unwrap().radio_playlist.clone();
+                        if let Some(pl) = radio {
+                            if pl.name == view {
+                                ui.add_space(8.0);
+                                match &pl.spotify_id {
+                                    Some(_) => {
+                                        ui.label(
+                                            RichText::new("on Spotify")
+                                                .weak()
+                                                .small(),
+                                        );
+                                    }
+                                    None => {
+                                        if labeled_button(ui, Icon::Plus, "Save to Spotify") {
+                                            self.send(Cmd::SaveRadioToSpotify);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     });
                 });
@@ -1186,16 +1205,38 @@ impl App {
                 // 5. The library tab. This is the ONLY way out — pop it, pick something, and the
                 //    app drops you straight back here.
                 let tab = egui::Rect::from_min_size(
-                    egui::pos2(full.min.x + 8.0, full.min.y + 8.0),
-                    Vec2::new(38.0, 34.0),
+                    egui::pos2(full.min.x + 10.0, full.min.y + 10.0),
+                    Vec2::new(34.0 + 8.0 + 34.0, 34.0),
                 );
                 let mut tui2 = ui.child_ui(tab, Layout::left_to_right(Align::Center), None);
+                tui2.spacing_mut().item_spacing.x = 8.0;
                 if icons::button(&mut tui2, Icon::Menu, 34.0, true)
                     .on_hover_text("Library (L)")
                     .clicked()
                     || ui.input(|i| i.key_pressed(egui::Key::L))
                 {
                     self.show_sidebar = true;
+                }
+
+                // Straight to the list that is CURRENTLY PLAYING — not "Liked Songs", and not
+                // whatever you last browsed. Only shown when something is actually queued.
+                let playing_list = {
+                    let s = self.state.lock().unwrap();
+                    (!s.queue.is_empty()).then(|| s.queue_view.clone())
+                };
+                if let Some(name) = playing_list {
+                    let hint = if name.is_empty() {
+                        "Back to what's playing".to_string()
+                    } else {
+                        format!("Back to “{name}”")
+                    };
+                    if icons::button(&mut tui2, Icon::ChevronLeft, 34.0, true)
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.send(Cmd::ShowPlayingList);
+                        self.vibe = false;
+                    }
                 }
                 let _ = bg_click;
 
