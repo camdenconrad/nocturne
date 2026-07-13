@@ -414,7 +414,28 @@ impl App {
             )
             .show(ctx, |ui| {
                 let view = self.state.lock().unwrap().view.clone();
+                // A back arrow to whatever is CURRENTLY PLAYING — not the list you happen to be
+                // looking at. Only offered when something is actually queued.
+                let playing_list = {
+                    let s = self.state.lock().unwrap();
+                    (!s.queue.is_empty()).then(|| s.queue_view.clone())
+                };
                 ui.horizontal(|ui| {
+                    if let Some(name) = &playing_list {
+                        let hint = if name.is_empty() {
+                            "Back to what's playing".to_string()
+                        } else {
+                            format!("Back to “{name}”")
+                        };
+                        if icons::button(ui, Icon::ChevronLeft, 24.0, false)
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            self.send(Cmd::ShowPlayingList);
+                            self.vibe = false;
+                            self.show_sidebar = false;
+                        }
+                    }
                     ui.label(RichText::new("LIBRARY").weak().small());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icons::button(ui, Icon::Close, 22.0, false)
@@ -426,28 +447,6 @@ impl App {
                     });
                 });
                 ui.add_space(8.0);
-
-                // Drop out of full screen into whatever list you're ALREADY in, without having to
-                // re-pick it from the sidebar.
-                if self.vibe {
-                    let label = if view.is_empty() {
-                        "Show list".to_string()
-                    } else {
-                        format!("Show “{view}”")
-                    };
-                    if ui
-                        .add_sized([ui.available_width(), 30.0], egui::Button::new(label))
-                        .on_hover_text("Back to the list view")
-                        .clicked()
-                    {
-                        if view.is_empty() {
-                            self.send(Cmd::LoadSaved);
-                        }
-                        self.vibe = false;
-                        self.show_sidebar = false;
-                    }
-                    ui.add_space(12.0);
-                }
 
                 // Clicking the ACTIVE item still navigates: from the vibe screen, "Liked Songs"
                 // being highlighted must not mean it's un-clickable — that's how you get back to it.

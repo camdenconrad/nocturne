@@ -25,6 +25,7 @@ pub enum Icon {
     Close,
     Search,
     Radio,
+    ChevronLeft,
 }
 
 /// Paint `icon` centred in `rect`. `rect` is the *icon box*; the glyph is inset from it.
@@ -219,6 +220,18 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 [Pos2::new(c.x + a, c.y - a), Pos2::new(c.x - a, c.y + a)],
                 stroke,
             );
+        }
+        Icon::ChevronLeft => {
+            let a = r * 0.42;
+            let stroke = Stroke::new(w * 1.15, color);
+            p.add(egui::Shape::line(
+                vec![
+                    Pos2::new(c.x + a * 0.7, c.y - a),
+                    Pos2::new(c.x - a * 0.7, c.y),
+                    Pos2::new(c.x + a * 0.7, c.y + a),
+                ],
+                stroke,
+            ));
         }
         Icon::Search => {
             p.circle_stroke(Pos2::new(c.x - r * 0.14, c.y - r * 0.14), r * 0.42, stroke);

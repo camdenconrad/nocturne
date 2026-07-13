@@ -40,6 +40,8 @@ pub enum Cmd {
     JumpTo(usize),
     /// Restore the last listening session (queue, track, position) — paused.
     Resume,
+    /// Show the list the currently-playing queue came from.
+    ShowPlayingList,
     /// Add a track to a playlist. Local: Spotify 403s playlist writes for restricted apps too.
     AddToPlaylist(String, Track),
 }
@@ -97,6 +99,9 @@ pub struct State {
     /// The live queue and where we are in it — drives Up Next / History panels.
     pub queue: Vec<Track>,
     pub qpos: usize,
+    /// The name of the list the QUEUE came from — which is not the same as `view`, because you can
+    /// be browsing one playlist while a different one is playing. The back arrow uses this.
+    pub queue_view: String,
     /// Locally liked track URIs.
     ///
     /// Spotify blocks library WRITES for restricted apps (`PUT /v1/me/tracks` → 403, with the
@@ -126,6 +131,7 @@ impl Default for State {
             analyzing: false,
             queue: Vec::new(),
             qpos: 0,
+            queue_view: String::new(),
             liked: Default::default(),
             art: Default::default(),
         }
@@ -777,6 +783,7 @@ async fn run(
                     s.queue = sess.queue.clone();
                     s.qpos = sess.qpos;
                     s.view = sess.view.clone();
+                    s.queue_view = sess.view.clone();
                     s.tracks = sess.queue.clone();
                     s.current_uri = Some(t.uri.clone());
                     s.now = Some(NowPlaying {
@@ -831,6 +838,16 @@ async fn run(
                         }
                     });
                 }
+            }
+
+            Cmd::ShowPlayingList => {
+                set(&state, &repaint, |s| {
+                    if !s.queue.is_empty() {
+                        s.tracks = s.queue.clone();
+                        s.view = s.queue_view.clone();
+                        s.status = format!("{} tracks", s.queue.len());
+                    }
+                });
             }
 
             Cmd::AddToPlaylist(id, track) => {
@@ -1188,6 +1205,7 @@ pub struct Session {
     pub position_ms: u32,
     pub view: String,
 }
+
 
 fn save_session(state: &Shared, queue: &[Track], qpos: usize) {
     let (position_ms, view) = {
