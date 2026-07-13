@@ -18,14 +18,17 @@ const OAUTH_SCOPES: &[&str] = &[
     "user-read-private",
     "user-read-email",
     "user-library-read",
+    "user-library-modify",
     "playlist-read-private",
+    "playlist-modify-private",
+    "playlist-modify-public",
     "playlist-read-collaborative",
     "user-top-read",
     "user-read-recently-played",
 ];
 
 /// Scopes handed to the Web API token (same set, comma-joined as the token endpoint wants).
-pub const WEB_API_SCOPES: &str = "user-read-private,user-library-read,playlist-read-private,playlist-read-collaborative,user-top-read,user-read-recently-played";
+pub const WEB_API_SCOPES: &str = "user-read-private,user-library-read,user-library-modify,playlist-read-private,playlist-read-collaborative,user-top-read,user-read-recently-played";
 
 /// The Spotify app's client id, from the environment or a `.env` beside the binary/repo.
 /// No secret is needed anywhere — librespot's OAuth is PKCE.
@@ -73,6 +76,13 @@ fn to_api_track(t: librespot_metadata::Track) -> nocturne_api::Track {
         .iter()
         .min_by_key(|i| i.width)
         .map(|i| format!("https://i.scdn.co/image/{}", i.id.to_base16()));
+    // The big one, for the full-screen view.
+    let art_big = t
+        .album
+        .covers
+        .iter()
+        .max_by_key(|i| i.width)
+        .map(|i| format!("https://i.scdn.co/image/{}", i.id.to_base16()));
 
     nocturne_api::Track {
         uri: format!("spotify:track:{}", track_id_base62(&t.id)),
@@ -81,6 +91,7 @@ fn to_api_track(t: librespot_metadata::Track) -> nocturne_api::Track {
         album: t.album.name,
         duration_ms: t.duration.max(0) as u32,
         art_url,
+        art_big,
         popularity: Some(t.popularity.clamp(0, 100) as u32),
         explicit: Some(t.is_explicit),
     }
@@ -439,6 +450,22 @@ impl NocturneHandle {
             return Ok(Vec::new());
         }
         self.tracks_batch(&uris[..uris.len().min(BATCH)]).await
+    }
+
+    /// The largest cover for a track, straight from metadata.
+    ///
+    /// Needed because lists cached before `art_big` existed only carry the 64px thumbnail, and
+    /// Spotify's cover URLs are per-size file ids — you cannot derive the big one from the small
+    /// one. So ask.
+    pub async fn big_cover(&self, track_uri: &str) -> Option<String> {
+        use librespot_metadata::{Metadata, Track};
+        let uri = SpotifyUri::from_uri(track_uri).ok()?;
+        let t = Track::get(&self.session, &uri).await.ok()?;
+        t.album
+            .covers
+            .iter()
+            .max_by_key(|i| i.width)
+            .map(|i| format!("https://i.scdn.co/image/{}", i.id.to_base16()))
     }
 
     /// Spotify's **real** audio features (energy, valence, tempo, danceability…).

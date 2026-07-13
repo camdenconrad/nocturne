@@ -2397,6 +2397,7 @@ dependencies = [
  "reqwest",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -2415,6 +2416,7 @@ dependencies = [
  "nocturne-session",
  "nocturne-sink",
  "nocturne-taste",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -2466,6 +2468,7 @@ version = "0.1.0"
 dependencies = [
  "WatchTower",
  "nocturne-api",
+ "reqwest",
  "serde",
  "serde_json",
  "tracing",

@@ -17,6 +17,8 @@ pub enum ApiError {
     Http(#[from] reqwest::Error),
     #[error("spotify returned {status}: {body}")]
     Status { status: u16, body: String },
+    #[error("Spotify rate limit — retry in {}h. Using cached library.", retry_after / 3600)]
+    RateLimited { retry_after: u64 },
 }
 
 /// A track as the UI wants it: already flattened, artists already joined.
@@ -28,8 +30,12 @@ pub struct Track {
     pub artists: String,
     pub album: String,
     pub duration_ms: u32,
-    /// Smallest available cover, for the row thumbnail / now-playing art.
+    /// Smallest available cover — for row thumbnails, where a 640px image is a waste.
     pub art_url: Option<String>,
+    /// LARGEST available cover (typically 640×640) — for the full-screen view, which was upscaling
+    /// the 64px thumbnail and looked exactly as bad as that sounds.
+    #[serde(default)]
+    pub art_big: Option<String>,
     /// Signals for the taste model. Optional because the two metadata sources (Web API and
     /// librespot) don't always carry them.
     #[serde(default)]
@@ -88,22 +94,54 @@ impl Client {
         }
     }
 
+    /// GET with 429 handling.
+    ///
+    /// Spotify rate-limits, and it tells you for how long in `Retry-After`. Firing 8 pages at once
+    /// (which is how the library used to load) reliably tripped it and surfaced as a bare
+    /// "429: Too many requests" in the UI. Honour the header, retry a few times, and only then give
+    /// up — a rate limit is a "wait", not an error.
     async fn get<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, ApiError> {
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status {
-                status: status.as_u16(),
-                body,
-            });
+        for attempt in 0..5u32 {
+            let resp = self.http.get(url).bearer_auth(&self.token).send().await?;
+            let status = resp.status();
+
+            if status.as_u16() == 429 {
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    // No header: back off exponentially rather than guessing small.
+                    .unwrap_or(1 << attempt);
+
+                // Spotify's rate limits come in two flavours. A short one (seconds) is a "slow
+                // down" and is worth waiting out. A long one — it will happily hand back 80,000+
+                // seconds, i.e. a day — is a penalty box, and sleeping through it is not a thing an
+                // app can do. Fail immediately so the caller falls back to the disk cache instead
+                // of hanging, and say so in a way the user can act on.
+                if wait > 60 {
+                    tracing::error!(
+                        "spotify rate limit: locked out for {wait}s (~{}h) — serving from cache",
+                        wait / 3600
+                    );
+                    return Err(ApiError::RateLimited { retry_after: wait });
+                }
+
+                tracing::warn!("spotify rate limit — waiting {wait}s (attempt {})", attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ApiError::Status {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            return Ok(resp.json().await?);
         }
-        Ok(resp.json().await?)
+        Err(ApiError::RateLimited { retry_after: 0 })
     }
 
     /// Spotify caps search `limit` at **10** for restricted apps like ours — not the 50 the docs
@@ -126,7 +164,7 @@ impl Client {
                     Ok(r.tracks.items.into_iter().map(Into::into).collect::<Vec<Track>>())
                 }
             })
-            .buffered(4)
+            .buffered(2)
             .collect()
             .await;
 
@@ -176,7 +214,7 @@ impl Client {
                     .await?;
                 Ok(p.items)
             })
-            .buffered(8)
+            .buffered(3)
             .collect()
             .await;
 
@@ -309,6 +347,12 @@ impl From<RawTrack> for Track {
             .iter()
             .min_by_key(|i| i.width.unwrap_or(u32::MAX))
             .map(|i| i.url.clone());
+        let art_big = t
+            .album
+            .images
+            .iter()
+            .max_by_key(|i| i.width.unwrap_or(0))
+            .map(|i| i.url.clone());
         Track {
             uri: t.uri,
             name: t.name,
@@ -321,6 +365,7 @@ impl From<RawTrack> for Track {
             album: t.album.name,
             duration_ms: t.duration_ms,
             art_url,
+            art_big,
             popularity: t.popularity,
             explicit: t.explicit,
         }

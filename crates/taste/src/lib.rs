@@ -17,6 +17,7 @@
 //! carry the similarity. A track with no analysis — local files, some new releases — still embeds,
 //! just with the feature block zeroed and identity doing the work.
 
+pub mod llm;
 pub mod mood;
 
 pub use nocturne_api::{AudioFeatures, Track};
@@ -409,6 +410,98 @@ impl Taste {
             self.trained_sequences
         );
         scored.into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// The centroid of what he ACTUALLY finishes — his taste, as one point in acoustic space.
+    ///
+    /// Built from listening history weighted by completion: a track played to the end pulls the
+    /// centroid toward it, a track skipped at 5% barely moves it.
+    pub fn taste_centroid(&self, history: &[(Track, f32)]) -> Option<watchtower::Tensor> {
+        let mut acc = vec![0.0f32; FEATURE_DIMS];
+        let mut total = 0.0f32;
+        for (t, completion) in history {
+            let Some(f) = self.features.get(track_id(&t.uri)) else {
+                continue;
+            };
+            // Only finished-ish plays count as endorsement.
+            let w = *completion;
+            if w < 0.5 {
+                continue;
+            }
+            let v = mood::acoustic_vec(f);
+            for (i, x) in v.data.iter().enumerate().take(FEATURE_DIMS) {
+                acc[i] += x * w;
+            }
+            total += w;
+        }
+        (total > 0.0).then(|| {
+            for x in &mut acc {
+                *x /= total;
+            }
+            watchtower::Tensor::from_data(acc)
+        })
+    }
+
+    /// Tracks he SKIPPED hard — the negative signal. Anything acoustically close to these is
+    /// probably something he'll hate too.
+    pub fn dislikes(&self, history: &[(Track, f32)]) -> Vec<watchtower::Tensor> {
+        history
+            .iter()
+            .filter(|(_, c)| *c < 0.25)
+            .filter_map(|(t, _)| self.features.get(track_id(&t.uri)).map(mood::acoustic_vec))
+            .collect()
+    }
+
+    /// Tracks nearest a **mood**, biased by his taste and away from what he skips.
+    ///
+    /// A pure mood match will happily serve him music that fits "chill lofi" perfectly and that he
+    /// would still hate. So the score is the mood match, pulled toward his taste centroid and
+    /// pushed away from tracks he's skipped.
+    pub fn nearest_mood_for_me(
+        &self,
+        pool: &[Track],
+        target: &watchtower::Tensor,
+        history: &[(Track, f32)],
+        count: usize,
+    ) -> Vec<Track> {
+        let centroid = self.taste_centroid(history);
+        let dislikes = self.dislikes(history);
+
+        let mut scored: Vec<(f32, &Track)> = pool
+            .iter()
+            .filter_map(|t| {
+                let f = self.features.get(track_id(&t.uri))?;
+                let v = mood::acoustic_vec(f);
+
+                // The mood is the brief, so it dominates.
+                let mut score = v.cosine_similarity(target);
+
+                // Nudge toward what he actually finishes.
+                if let Some(c) = &centroid {
+                    score += 0.25 * v.cosine_similarity(c);
+                }
+
+                // Push away from what he skips. Worst offender decides — one strong resemblance to
+                // a hated track is enough to bury it.
+                if let Some(worst) = dislikes
+                    .iter()
+                    .map(|d| v.cosine_similarity(d))
+                    .fold(None::<f32>, |m, x| Some(m.map_or(x, |m| m.max(x))))
+                {
+                    score -= 0.35 * worst;
+                }
+                Some((score, t))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut seen = std::collections::HashSet::new();
+        scored
+            .into_iter()
+            .filter(|(_, t)| seen.insert((t.name.to_lowercase(), t.artists.to_lowercase())))
+            .take(count)
+            .map(|(_, t)| t.clone())
+            .collect()
     }
 
     /// Tracks nearest a **mood**, from a pool (his library). The engine behind mood radio.

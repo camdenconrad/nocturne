@@ -31,6 +31,14 @@ pub enum Cmd {
     TrainTaste,
     /// Start a radio from a mood phrase ("chill winter lofi vibes").
     MoodRadio(String),
+    /// Replace the queue with this list and play it from the top.
+    PlayQueue(Vec<Track>),
+    /// Add/remove a track from the local library.
+    ToggleLike(String),
+    /// Jump to a track already in the queue (clicking Up Next).
+    JumpTo(usize),
+    /// Restore the last listening session (queue, track, position) — paused.
+    Resume,
 }
 
 #[derive(Default, Clone)]
@@ -39,6 +47,8 @@ pub struct NowPlaying {
     pub artists: String,
     pub duration_ms: u32,
     pub art_url: Option<String>,
+    /// Full-resolution cover for the full-screen view.
+    pub art_big: Option<String>,
     pub paused: bool,
     /// Position at the moment of the last player event…
     pub position_ms: u32,
@@ -81,6 +91,15 @@ pub struct State {
     pub taste_features: usize,
     /// True while the background analysis backfill is still running.
     pub analyzing: bool,
+    /// The live queue and where we are in it — drives Up Next / History panels.
+    pub queue: Vec<Track>,
+    pub qpos: usize,
+    /// Locally liked track URIs.
+    ///
+    /// Spotify blocks library WRITES for restricted apps (`PUT /v1/me/tracks` → 403, with the
+    /// user-library-modify scope granted, and no internal endpoint exists either). So likes live
+    /// here, on disk, and are merged with Spotify's Liked Songs for display. They do not sync back.
+    pub liked: std::collections::HashSet<String>,
     /// Decoded art bytes keyed by URL; the UI turns these into textures once.
     pub art: std::collections::HashMap<String, Vec<u8>>,
 }
@@ -102,6 +121,9 @@ impl Default for State {
             taste_trained: 0,
             taste_features: 0,
             analyzing: false,
+            queue: Vec::new(),
+            qpos: 0,
+            liked: Default::default(),
             art: Default::default(),
         }
     }
@@ -152,6 +174,13 @@ async fn run(
         Taste::load(&cache::model_path()).unwrap_or_default(),
     ));
     let mut backfilling = false;
+    // Where a restored session left off — the first play seeks here.
+    let mut resume_at: u32 = 0;
+    // Local likes (Spotify won't take writes — see State::liked).
+    {
+        let liked: Vec<String> = cache::list_get("local-likes").unwrap_or_default();
+        state.lock().unwrap().liked = liked.into_iter().collect();
+    }
     // The current listening run, with how much of each track was actually heard. A skip is the
     // only negative signal we get without asking the user anything.
     let mut run: Vec<(Track, f32)> = Vec::new();
@@ -210,13 +239,23 @@ async fn run(
                     set(&st, &rp, |s| s.view = "Liked Songs".into());
                     // Paint from disk first; the network refresh lands behind the visible list.
                     let cached: Option<Vec<Track>> = cache::list_get("liked");
+                    let cached_liked = cached.is_some();
                     if let Some(t) = cached {
+                        if std::env::var_os("NOCTURNE_PLAY_FIRST").is_some() {
+                            if let Some(first) = t.first() {
+                                let _ = tx2.send(Cmd::Play(first.uri.clone()));
+                            }
+                        }
                         show(&st, &rp, t);
                     } else {
                         busy(&st, &rp, "loading liked songs…".into());
                     }
                     if let Some(api) = api(&h, &st, &rp).await {
                         match api.saved_tracks(5000).await {
+                            Ok(t) if t.is_empty() && cached_liked => {
+                                // Don't let an empty/failed refresh blank out a good cached list.
+                                tracing::warn!("liked songs came back empty — keeping cache");
+                            }
                             Ok(t) => {
                                 cache::list_put("liked", &t);
                                 // Debug hook: play the first track automatically, so time-to-audio
@@ -316,6 +355,22 @@ async fn run(
 
             Cmd::PlayPause => {
                 if let Some(h) = &handle {
+                    // First play after a restore: the player has nothing loaded, so load the track
+                    // and seek to where he stopped rather than restarting it.
+                    if resume_at > 0 && !queue.is_empty() {
+                        let at = resume_at;
+                        resume_at = 0;
+                        paused = false;
+                        start(&state, &repaint, h, &queue, qpos);
+                        h.seek(at);
+                        set(&state, &repaint, |s| {
+                            if let Some(n) = &mut s.now {
+                                n.position_ms = at;
+                                n.since = Some(Instant::now());
+                            }
+                        });
+                        continue;
+                    }
                     paused = !paused;
                     if paused {
                         h.pause()
@@ -355,8 +410,39 @@ async fn run(
                             .collect();
                         match radio(h, &seed, &prev).await {
                             Ok(more) if !more.is_empty() => {
-                                // Spotify picks the candidates; the taste model picks the order.
-                                let more = taste.lock().unwrap().rank(more);
+                                // Spotify picks the candidates; his listening picks the order —
+                                // biased toward what he finishes, away from what he skips.
+                                let history: Vec<(Track, f32)> =
+                                    cache::list_get::<Vec<Vec<(Track, f32)>>>("history")
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .flatten()
+                                        .collect();
+                                let more = {
+                                    let mut t = taste.lock().unwrap();
+                                    let ranked = t.rank(more);
+                                    if history.len() >= 8 {
+                                        // Once there's real history, drop anything close to what he
+                                        // skips rather than merely ranking it lower.
+                                        let dislikes = t.dislikes(&history);
+                                        ranked
+                                            .into_iter()
+                                            .filter(|tr| {
+                                                let Some(f) = t.features().get(
+                                                    nocturne_taste::track_id(&tr.uri),
+                                                ) else {
+                                                    return true;
+                                                };
+                                                let v = nocturne_taste::mood::acoustic_vec(f);
+                                                !dislikes
+                                                    .iter()
+                                                    .any(|d| v.cosine_similarity(d) > 0.97)
+                                            })
+                                            .collect()
+                                    } else {
+                                        ranked
+                                    }
+                                };
                                 tracing::info!("radio: queued {} more tracks", more.len());
                                 set(&state, &repaint, |s| {
                                     s.radio_loading = false;
@@ -473,6 +559,94 @@ async fn run(
                         run.push((t.clone(), 0.0));
                     }
                     start(&state, &repaint, h, &queue, qpos);
+                }
+            }
+
+            Cmd::PlayQueue(tracks) => {
+                if let Some(h) = &handle {
+                    record(&state, &mut run, &taste, &repaint);
+                    queue = tracks;
+                    qpos = 0;
+                    paused = false;
+                    if let Some(t) = queue.first() {
+                        taste.lock().unwrap().observe(t);
+                        run.push((t.clone(), 0.0));
+                    }
+                    start(&state, &repaint, h, &queue, qpos);
+                }
+            }
+
+            Cmd::ToggleLike(uri) => {
+                let now: Vec<String> = {
+                    let mut s = state.lock().unwrap();
+                    if !s.liked.remove(&uri) {
+                        s.liked.insert(uri.clone());
+                    }
+                    s.liked.iter().cloned().collect()
+                };
+                cache::list_put("local-likes", &now);
+                repaint();
+            }
+
+            Cmd::Resume => {
+                let Some(sess) = cache::list_get::<Session>("session") else {
+                    continue;
+                };
+                if sess.queue.is_empty() {
+                    continue;
+                }
+                let Some(t) = sess.queue.get(sess.qpos).cloned() else {
+                    continue;
+                };
+                tracing::info!(
+                    "resuming: “{}” at {}s ({} in queue)",
+                    t.name,
+                    sess.position_ms / 1000,
+                    sess.queue.len()
+                );
+                queue = sess.queue.clone();
+                qpos = sess.qpos;
+                paused = true;
+
+                // Restore the UI to exactly where he left it — but PAUSED. Reopening an app should
+                // not start blasting music at you.
+                let art = t
+                    .art_url
+                    .as_ref()
+                    .and_then(|u| cache::art_get(u).map(|b| (u.clone(), b)));
+                set(&state, &repaint, |s| {
+                    s.queue = sess.queue.clone();
+                    s.qpos = sess.qpos;
+                    s.view = sess.view.clone();
+                    s.tracks = sess.queue.clone();
+                    s.current_uri = Some(t.uri.clone());
+                    s.now = Some(NowPlaying {
+                        name: t.name.clone(),
+                        artists: t.artists.clone(),
+                        duration_ms: t.duration_ms,
+                        art_url: t.art_url.clone(),
+                        art_big: t.art_big.clone(),
+                        paused: true,
+                        position_ms: sess.position_ms,
+                        since: None,
+                    });
+                    if let Some((u, b)) = art {
+                        s.art.entry(u).or_insert(b);
+                    }
+                });
+                resume_at = sess.position_ms;
+            }
+
+            Cmd::JumpTo(i) => {
+                if let Some(h) = &handle {
+                    if i < queue.len() {
+                        record(&state, &mut run, &taste, &repaint);
+                        qpos = i;
+                        paused = false;
+                        taste.lock().unwrap().observe(&queue[i]);
+                        run.push((queue[i].clone(), 0.0));
+                        start(&state, &repaint, h, &queue, qpos);
+                    }
                 }
             }
 
@@ -718,30 +892,110 @@ fn stop_playback(state: &Shared, repaint: &(impl Fn() + Send), h: &Arc<NocturneH
     });
 }
 
+/// Point the now-playing at the big cover once we have it.
+fn set_big(state: &Shared, uri: &str, big: &str) {
+    let mut s = state.lock().unwrap();
+    if s.current_uri.as_deref() == Some(uri) {
+        if let Some(n) = &mut s.now {
+            n.art_big = Some(big.to_string());
+        }
+    }
+}
+
+/// The last listening session, so closing and reopening Nocturne picks up where he left off
+/// instead of dumping him on an empty screen.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct Session {
+    pub queue: Vec<Track>,
+    pub qpos: usize,
+    pub position_ms: u32,
+    pub view: String,
+}
+
+fn save_session(state: &Shared, queue: &[Track], qpos: usize) {
+    let (position_ms, view) = {
+        let s = state.lock().unwrap();
+        (
+            s.now.as_ref().map(|n| n.elapsed_ms()).unwrap_or(0),
+            s.view.clone(),
+        )
+    };
+    cache::list_put(
+        "session",
+        &Session {
+            queue: queue.to_vec(),
+            qpos,
+            position_ms,
+            view,
+        },
+    );
+}
+
 /// Load queue[i] and reflect it in the UI immediately (don't wait for the player event).
 ///
 /// Timing is logged: time-to-audio is the number that decides whether this app feels native or
 /// feels like a webapp, so it's measured, not assumed.
 fn start(
     state: &Shared,
-    repaint: &(impl Fn() + Send),
+    repaint: &(impl Fn() + Send + Sync + Clone + 'static),
     h: &Arc<NocturneHandle>,
     queue: &[Track],
     i: usize,
 ) {
     let Some(t) = queue.get(i) else { return };
+    // The full-size cover, for the full-screen view. Fetched per track (not per list) because it's
+    // ~100KB and only one is ever on screen. If the track predates `art_big` (anything already in
+    // the list cache), ask metadata for it — the big URL cannot be derived from the small one.
+    {
+        let (st, rp, hh) = (state.clone(), repaint.clone(), h.clone());
+        let known = t.art_big.clone();
+        let uri = t.uri.clone();
+        tokio::spawn(async move {
+            let big = match known {
+                Some(b) => Some(b),
+                None => hh.big_cover(&uri).await,
+            };
+            let Some(big) = big else { return };
+
+            if st.lock().unwrap().art.contains_key(&big) {
+                set_big(&st, &uri, &big);
+                rp();
+                return;
+            }
+            let bytes = match cache::art_get(&big) {
+                Some(b) => Some(b),
+                None => match reqwest::get(&big).await {
+                    Ok(r) => r.bytes().await.ok().map(|b| {
+                        let b = b.to_vec();
+                        cache::art_put(&big, &b);
+                        b
+                    }),
+                    Err(_) => None,
+                },
+            };
+            if let Some(bytes) = bytes {
+                st.lock().unwrap().art.insert(big.clone(), bytes);
+                set_big(&st, &uri, &big);
+                rp();
+            }
+        });
+    }
     set(state, repaint, |s| {
+        s.queue = queue.to_vec();
+        s.qpos = i;
         s.current_uri = Some(t.uri.clone());
         s.now = Some(NowPlaying {
             name: t.name.clone(),
             artists: t.artists.clone(),
             duration_ms: t.duration_ms,
             art_url: t.art_url.clone(),
+            art_big: t.art_big.clone(),
             paused: false,
             position_ms: 0,
             since: Some(Instant::now()),
         });
     });
+    save_session(state, queue, i);
     let t0 = Instant::now();
     match librespot_uri(&t.uri) {
         Ok(u) => {
@@ -809,11 +1063,23 @@ async fn api(
 }
 
 /// Paint a list of tracks with no network work at all (used for cache hits).
+///
+/// This must also pull the covers off the disk cache. It didn't, and the result was that any list
+/// served from cache — which is most of them — rendered with grey placeholder squares where every
+/// album cover should be, even though the images were sitting right there on disk.
 fn show(state: &Shared, repaint: &(impl Fn() + Send), tracks: Vec<Track>) {
+    let art: Vec<(String, Vec<u8>)> = tracks
+        .iter()
+        .filter_map(|t| t.art_url.clone())
+        .filter_map(|u| cache::art_get(&u).map(|b| (u, b)))
+        .collect();
     set(state, repaint, |s| {
         s.busy = false;
         s.status = format!("{} tracks", tracks.len());
         s.tracks = tracks;
+        for (u, b) in art {
+            s.art.entry(u).or_insert(b);
+        }
     });
 }
 
@@ -917,3 +1183,4 @@ fn fail(state: &Shared, repaint: &(impl Fn() + Send + ?Sized), msg: String) {
 fn erase(f: &(impl Fn() + Send + Clone + 'static)) -> Box<dyn Fn() + Send> {
     Box::new(f.clone())
 }
+
