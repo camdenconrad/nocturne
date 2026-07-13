@@ -172,6 +172,7 @@ pub enum SessionError {
 pub struct NocturneHandle {
     session: Session,
     player: std::sync::Arc<Player>,
+    mixer: std::sync::Arc<SoftMixer>,
     /// Our own OAuth token — see [`NocturneHandle::web_token`] for why librespot's isn't used.
     oauth: std::sync::Arc<tokio::sync::Mutex<librespot_oauth::OAuthToken>>,
 }
@@ -204,8 +205,10 @@ impl NocturneHandle {
             .await
             .map_err(|e| SessionError::Connect(e.to_string()))?;
 
-        let mixer = SoftMixer::open(MixerConfig::default())
-            .map_err(|e| SessionError::Connect(e.to_string()))?;
+        let mixer = std::sync::Arc::new(
+            SoftMixer::open(MixerConfig::default())
+                .map_err(|e| SessionError::Connect(e.to_string()))?,
+        );
         let player = Player::new(
             PlayerConfig::default(),
             session.clone(),
@@ -216,6 +219,7 @@ impl NocturneHandle {
         Ok(Self {
             session,
             player,
+            mixer,
             oauth: std::sync::Arc::new(tokio::sync::Mutex::new(token)),
         })
     }
@@ -316,6 +320,11 @@ impl NocturneHandle {
 
     pub fn seek(&self, position_ms: u32) {
         self.player.seek(position_ms);
+    }
+
+    /// 0.0..=1.0. SoftMixer takes a u16 across its own range.
+    pub fn set_volume(&self, v: f32) {
+        self.mixer.set_volume((v.clamp(0.0, 1.0) * u16::MAX as f32) as u16);
     }
 
     pub fn stop(&self) {
