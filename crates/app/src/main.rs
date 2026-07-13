@@ -4,6 +4,7 @@ mod emoji;
 mod fonts;
 mod icons;
 mod mpris;
+mod upscale;
 
 use backend::{Cmd, NowPlaying, Shared};
 use eframe::egui;
@@ -90,6 +91,9 @@ struct App {
     blurred: HashMap<String, egui::TextureHandle>,
     /// The track whose "add to playlist" dialog is open, if any.
     add_to: Option<nocturne_api::Track>,
+    /// ESRGAN-upscaled covers, keyed by the original art url. Requested once per cover.
+    hires: HashMap<String, Option<egui::TextureHandle>>,
+    hires_pending: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -111,6 +115,8 @@ impl App {
             vibe: true,
             blurred: HashMap::new(),
             add_to: None,
+            hires: HashMap::new(),
+            hires_pending: Default::default(),
         }
     }
 
@@ -185,6 +191,60 @@ impl App {
         let tex = ctx.load_texture(url, color, egui::TextureOptions::LINEAR);
         self.textures.insert(url.to_string(), tex.clone());
         Some(tex)
+    }
+
+    /// The full-screen cover, upscaled 4× by Real-ESRGAN on the GPU.
+    ///
+    /// Returns the original until the pass finishes (about a second on the 4080), so the view never
+    /// waits on it — the cover simply sharpens a moment after it appears.
+    fn art_hires(&mut self, ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
+        if let Some(hit) = self.hires.get(url) {
+            if let Some(t) = hit {
+                return Some(t.clone());
+            }
+            return self.art(ctx, url); // upscale failed once; don't retry forever
+        }
+
+        // Kick the pass off exactly once per cover.
+        if !self.hires_pending.contains(url) {
+            let bytes = self.state.lock().unwrap().art.get(url).cloned();
+            if let Some(bytes) = bytes {
+                self.hires_pending.insert(url.to_string());
+                let art_id = url.rsplit('/').next().unwrap_or("art").to_string();
+                let url_owned = url.to_string();
+                let state = self.state.clone();
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let out = upscale::upscale(&art_id, &bytes);
+                    if let Some(png) = out {
+                        state
+                            .lock()
+                            .unwrap()
+                            .art
+                            .insert(format!("{url_owned}#hires"), png);
+                        ctx2.request_repaint();
+                    }
+                });
+            }
+        }
+
+        // Has the worker landed it yet?
+        let key = format!("{url}#hires");
+        let bytes = self.state.lock().unwrap().art.get(&key).cloned();
+        if let Some(bytes) = bytes {
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let img = img.to_rgba8();
+                let size = [img.width() as usize, img.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+                let tex = ctx.load_texture(&key, color, egui::TextureOptions::LINEAR);
+                self.hires.insert(url.to_string(), Some(tex.clone()));
+                self.hires_pending.remove(url);
+                return Some(tex);
+            }
+        }
+
+        // Not ready (or not possible): the original, which is what the user sees today.
+        self.art(ctx, url)
     }
 
     fn art_at(
@@ -366,6 +426,28 @@ impl App {
                     });
                 });
                 ui.add_space(8.0);
+
+                // Drop out of full screen into whatever list you're ALREADY in, without having to
+                // re-pick it from the sidebar.
+                if self.vibe {
+                    let label = if view.is_empty() {
+                        "Show list".to_string()
+                    } else {
+                        format!("Show “{view}”")
+                    };
+                    if ui
+                        .add_sized([ui.available_width(), 30.0], egui::Button::new(label))
+                        .on_hover_text("Back to the list view")
+                        .clicked()
+                    {
+                        if view.is_empty() {
+                            self.send(Cmd::LoadSaved);
+                        }
+                        self.vibe = false;
+                        self.show_sidebar = false;
+                    }
+                    ui.add_space(12.0);
+                }
 
                 // Clicking the ACTIVE item still navigates: from the vibe screen, "Liked Songs"
                 // being highlighted must not mean it's un-clickable — that's how you get back to it.
@@ -842,21 +924,23 @@ impl App {
                 // sized slider (add_sized does NOT stretch a Slider — spacing.slider_width does),
                 // fixed-width times, and the right-hand one counting down.
                 let _ = cui;
-                const BH: f32 = 34.0;
+                const BSIDE: f32 = 32.0;
+                const BPLAY: f32 = 40.0;
+                const BGAP: f32 = 10.0;
                 let brow = egui::Rect::from_center_size(
-                    egui::pos2(centre.center().x, centre.min.y + 24.0),
-                    Vec2::new(150.0, BH),
+                    egui::pos2(centre.center().x, centre.min.y + 26.0),
+                    Vec2::new(BSIDE * 2.0 + BPLAY + BGAP * 2.0, BPLAY),
                 );
                 let mut bui = ui.child_ui(brow, Layout::left_to_right(Align::Center), None);
-                bui.spacing_mut().item_spacing.x = 8.0;
-                if icons::button(&mut bui, Icon::Prev, BH, true).clicked() {
+                bui.spacing_mut().item_spacing.x = BGAP;
+                if icons::button(&mut bui, Icon::Prev, BSIDE, true).clicked() {
                     self.send(Cmd::Prev);
                 }
                 let pp = if n.paused { Icon::Play } else { Icon::Pause };
-                if icons::button(&mut bui, pp, BH + 6.0, true).clicked() {
+                if icons::button(&mut bui, pp, BPLAY, true).clicked() {
                     self.send(Cmd::PlayPause);
                 }
-                if icons::button(&mut bui, Icon::Next, BH, true).clicked() {
+                if icons::button(&mut bui, Icon::Next, BSIDE, true).clicked() {
                     self.send(Cmd::Next);
                 }
 
@@ -968,10 +1052,24 @@ impl App {
                     Rounding::same(20.0),
                     Color32::from_black_alpha(90),
                 );
-                let mut aui = ui.child_ui(art_rect, Layout::top_down(Align::Center), None);
-                // The big cover — a 640px image, not the 64px thumbnail upscaled.
+                // The big cover, run through Real-ESRGAN (4×, on the GPU) — Spotify's 640px master
+                // is soft when stretched across a 4K panel.
                 let big = n.art_big.clone().or_else(|| n.art_url.clone());
-                self.art_at(&mut aui, &ctx2, big.as_ref(), art_size, 16.0);
+                match big.as_ref().and_then(|u| self.art_hires(&ctx2, u)) {
+                    Some(tex) => {
+                        ui.painter().image(
+                            tex.id(),
+                            art_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                    None => {
+                        let mut aui =
+                            ui.child_ui(art_rect, Layout::top_down(Align::Center), None);
+                        self.art_at(&mut aui, &ctx2, big.as_ref(), art_size, 16.0);
+                    }
+                }
 
                 // 3. Title + artist, centred under the art.
                 let text_y = art_rect.max.y + 22.0;
@@ -1063,22 +1161,26 @@ impl App {
 
                 // All three buttons share ONE height, so ⏮ and ⏭ sit on the play button's centre
                 // line instead of riding high.
-                const BTN_H: f32 = 44.0;
-                let row_w = 44.0 + 52.0 + 44.0 + 20.0;
+                // The row must be as tall as its TALLEST child, or a bigger play button cannot be
+                // vertically centred in it — it overflows and everything sits off the centre line.
+                const SIDE_BTN: f32 = 42.0;
+                const PLAY_BTN: f32 = 52.0;
+                const BTN_GAP: f32 = 12.0;
+                let row_w = SIDE_BTN * 2.0 + PLAY_BTN + BTN_GAP * 2.0;
                 let row = egui::Rect::from_center_size(
-                    egui::pos2(ctrl.center().x, ctrl.min.y + 58.0),
-                    Vec2::new(row_w, BTN_H),
+                    egui::pos2(ctrl.center().x, ctrl.min.y + 62.0),
+                    Vec2::new(row_w, PLAY_BTN),
                 );
                 let mut bui = ui.child_ui(row, Layout::left_to_right(Align::Center), None);
-                bui.spacing_mut().item_spacing.x = 10.0;
-                if icons::button(&mut bui, Icon::Prev, BTN_H, true).clicked() {
+                bui.spacing_mut().item_spacing.x = BTN_GAP;
+                if icons::button(&mut bui, Icon::Prev, SIDE_BTN, true).clicked() {
                     self.send(Cmd::Prev);
                 }
                 let pp = if n.paused { Icon::Play } else { Icon::Pause };
-                if icons::button(&mut bui, pp, BTN_H + 8.0, true).clicked() {
+                if icons::button(&mut bui, pp, PLAY_BTN, true).clicked() {
                     self.send(Cmd::PlayPause);
                 }
-                if icons::button(&mut bui, Icon::Next, BTN_H, true).clicked() {
+                if icons::button(&mut bui, Icon::Next, SIDE_BTN, true).clicked() {
                     self.send(Cmd::Next);
                 }
 

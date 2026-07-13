@@ -21,6 +21,11 @@ fn art_dir() -> PathBuf {
     root().join("art")
 }
 
+/// ESRGAN-upscaled covers. Separate from `art/` so clearing one doesn't nuke the other.
+pub fn art_hires_dir() -> PathBuf {
+    root().join("art-hires")
+}
+
 fn list_dir() -> PathBuf {
     root().join("lists")
 }
