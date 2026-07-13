@@ -17,7 +17,14 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+futures-util = "0.3"
+librespot-protocol = { git = "https://github.com/librespot-org/librespot", branch = "dev" }
+protobuf = "3.7"
+nocturne-api = { path = "../api" }
+
 [dev-dependencies]
 nocturne-sink = { path = "../sink" }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 nocturne-api = { path = "../api" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+serde_json = "1"

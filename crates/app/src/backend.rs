@@ -148,9 +148,11 @@ async fn run(
             }
 
             Cmd::OpenPlaylist(id) => {
-                if let Some(api) = api(&handle, &state, &repaint).await {
+                // Playlist contents come from librespot's internal protocol, NOT the Web API,
+                // which 403s playlist tracks for post-2024 apps. Art still needs an HTTP fetch.
+                if let (Some(h), Some(api)) = (handle.clone(), api(&handle, &state, &repaint).await) {
                     busy(&state, &repaint, "loading playlist…".into());
-                    match api.playlist_tracks(&id, 2000).await {
+                    match h.playlist_tracks(&id).await {
                         Ok(t) => finish_tracks(&state, &repaint, t, &api).await,
                         Err(e) => fail(&state, &repaint, format!("playlist: {e}")),
                     }

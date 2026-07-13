@@ -52,6 +52,45 @@ fn client_id() -> Result<String, SessionError> {
     ))
 }
 
+/// Tracks per extended-metadata request. Spotify's own client batches; 100 is comfortably within
+/// what the endpoint accepts and keeps a 300-track playlist to three round trips.
+const BATCH: usize = 100;
+
+/// librespot's metadata `Track` → the flat shape the UI already renders.
+fn to_api_track(t: librespot_metadata::Track) -> nocturne_api::Track {
+    let artists = t
+        .artists_with_role
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Covers are file ids, not URLs; the CDN path is the base16 of the id. Pick the smallest
+    // for thumbnails, same rule as the Web API path.
+    let art_url = t
+        .album
+        .covers
+        .iter()
+        .min_by_key(|i| i.width)
+        .map(|i| format!("https://i.scdn.co/image/{}", i.id.to_base16()));
+
+    nocturne_api::Track {
+        uri: format!("spotify:track:{}", track_id_base62(&t.id)),
+        name: t.name,
+        artists,
+        album: t.album.name,
+        duration_ms: t.duration.max(0) as u32,
+        art_url,
+    }
+}
+
+fn track_id_base62(uri: &SpotifyUri) -> String {
+    match uri {
+        SpotifyUri::Track { id } => id.to_base62(),
+        _ => String::new(),
+    }
+}
+
 fn oauth_client() -> Result<librespot_oauth::OAuthClient, SessionError> {
     librespot_oauth::OAuthClientBuilder::new(
         &client_id()?,
@@ -192,6 +231,87 @@ impl NocturneHandle {
     /// Track/position/state changes, for the UI's now-playing bar.
     pub fn player_events(&self) -> librespot_playback::player::PlayerEventChannel {
         self.player.get_player_event_channel()
+    }
+
+    /// Playlist contents, over Spotify's **internal** protocol rather than the Web API.
+    ///
+    /// This is not a stylistic choice. Spotify 403s `/v1/playlists/{id}/tracks` AND
+    /// `/v1/tracks?ids=` for apps registered after their 2024 lockdown — even for playlists you
+    /// own, with every scope granted. `/v1/playlists/{id}` still returns 200 but with the track
+    /// list stripped out. librespot's metadata layer speaks the protocol the real client uses,
+    /// which has no such restriction, so playlists come from here and search stays on the Web API.
+    pub async fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<nocturne_api::Track>, SessionError> {
+        use librespot_metadata::{Metadata, Playlist};
+
+        let id = SpotifyId::from_base62(playlist_id)
+            .map_err(|e| SessionError::Connect(format!("bad playlist id: {e}")))?;
+        let list = Playlist::get(&self.session, &SpotifyUri::Playlist { id, user: None })
+            .await
+            .map_err(|e| SessionError::Connect(format!("playlist: {e}")))?;
+
+        // Fetch track metadata in BATCHES, not one request per track. librespot's `Track::get`
+        // issues a request per id; on a 300-track playlist that stampedes Spotify's extended-
+        // metadata service, which rate-limits the whole session ("resource has been exhausted")
+        // and then poisons every playlist opened afterwards. The batched entity endpoint is what
+        // the real client uses, and it takes the whole chunk in one round trip.
+        let uris: Vec<SpotifyUri> = list.tracks().cloned().collect();
+        let mut out = Vec::with_capacity(uris.len());
+        for chunk in uris.chunks(BATCH) {
+            out.extend(self.tracks_batch(chunk).await?);
+        }
+        Ok(out)
+    }
+
+    /// One extended-metadata round trip for up to [`BATCH`] tracks.
+    async fn tracks_batch(&self, uris: &[SpotifyUri]) -> Result<Vec<nocturne_api::Track>, SessionError> {
+        use librespot_metadata::Metadata;
+        use librespot_protocol::extended_metadata::{
+            BatchedEntityRequest, EntityRequest, ExtensionQuery,
+        };
+        use librespot_protocol::extension_kind::ExtensionKind;
+        use protobuf::{EnumOrUnknown, Message};
+
+        let req = BatchedEntityRequest {
+            entity_request: uris
+                .iter()
+                .map(|uri| EntityRequest {
+                    entity_uri: uri.to_uri(),
+                    query: vec![ExtensionQuery {
+                        extension_kind: EnumOrUnknown::new(ExtensionKind::TRACK_V4),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let res = self
+            .session
+            .spclient()
+            .get_extended_metadata(req)
+            .await
+            .map_err(|e| SessionError::Connect(format!("metadata: {e}")))?;
+
+        let mut out = Vec::new();
+        for array in res.extended_metadata {
+            for entry in array.extension_data {
+                let Some(any) = entry.extension_data.as_ref() else {
+                    continue;
+                };
+                let Ok(msg) = librespot_protocol::metadata::Track::parse_from_bytes(&any.value)
+                else {
+                    continue;
+                };
+                let Ok(uri) = SpotifyUri::from_uri(&entry.entity_uri) else {
+                    continue;
+                };
+                if let Ok(track) = librespot_metadata::Track::parse(&msg, &uri) {
+                    out.push(to_api_track(track));
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn seek(&self, position_ms: u32) {

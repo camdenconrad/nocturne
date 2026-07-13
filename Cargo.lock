@@ -2324,14 +2324,19 @@ dependencies = [
 name = "nocturne-session"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "librespot-connect",
  "librespot-core",
  "librespot-discovery",
  "librespot-metadata",
  "librespot-oauth",
  "librespot-playback",
+ "librespot-protocol",
  "nocturne-api",
  "nocturne-sink",
+ "protobuf",
+ "reqwest",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
