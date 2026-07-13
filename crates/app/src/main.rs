@@ -1,5 +1,6 @@
 mod backend;
 mod cache;
+mod fonts;
 
 use backend::{Cmd, NowPlaying, Shared};
 use eframe::egui;
@@ -31,6 +32,7 @@ fn main() -> eframe::Result<()> {
         "Nocturne",
         options,
         Box::new(|cc| {
+            fonts::install(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let (state, tx) = backend::spawn(move || ctx.request_repaint());
             Ok(Box::new(App::new(state, tx)))

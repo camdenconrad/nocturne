@@ -102,53 +102,105 @@ fn oauth_client() -> Result<librespot_oauth::OAuthClient, SessionError> {
     .map_err(|e| SessionError::OAuth(e.to_string()))
 }
 
-fn refresh_token_path() -> std::path::PathBuf {
-    dirs_cache().join("nocturne").join("oauth-refresh")
+fn token_path() -> std::path::PathBuf {
+    dirs_cache().join("nocturne").join("oauth.json")
+}
+
+/// The persisted OAuth token. `expires_at` is stored as a unix timestamp because librespot's
+/// `Instant` is process-relative and meaningless across restarts — the bug that made every launch
+/// spend a refresh.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredToken {
+    access_token: String,
+    refresh_token: String,
+    expires_at_unix: u64,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// True when a previous consent is on disk, so login will be silent (no browser). The UI uses this
 /// to sign in on startup instead of making the user click a button that never asks them anything.
 pub fn has_cached_login() -> bool {
-    std::fs::read_to_string(refresh_token_path())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+    load_token().is_some()
 }
 
-/// The refresh token is a long-lived credential to the account — treat it like a secret.
-fn save_refresh_token(rt: &str) {
-    let path = refresh_token_path();
+fn load_token() -> Option<StoredToken> {
+    let bytes = std::fs::read(token_path()).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Refresh tokens are long-lived credentials to the account: 0600, and written atomically so a
+/// crash mid-write can't leave a truncated token that forces a re-login.
+fn save_token(tok: &librespot_oauth::OAuthToken) {
+    let stored = StoredToken {
+        access_token: tok.access_token.clone(),
+        refresh_token: tok.refresh_token.clone(),
+        expires_at_unix: now_unix()
+            + tok
+                .expires_at
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs(),
+    };
+    let path = token_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if std::fs::write(&path, rt).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+    let Ok(bytes) = serde_json::to_vec(&stored) else {
+        return;
+    };
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, bytes).is_err() {
+        return;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    let _ = std::fs::rename(&tmp, &path);
 }
 
-/// Silent refresh if we've been here before; browser consent only on a cold start (or if the
-/// stored refresh token has been revoked/expired, in which case fall back to the full flow).
+/// Get a usable token with the *least* privilege escalation possible, in order:
+///
+///   1. the stored access token, if it hasn't expired — costs nothing, and crucially does NOT
+///      spend a refresh. Refresh tokens rotate on use, so refreshing on every launch was itself
+///      what kept invalidating the stored credential and forcing browser logins.
+///   2. a refresh, persisting the newly-rotated refresh token immediately.
+///   3. the full browser consent flow, only on a cold start or a genuinely dead credential.
 fn obtain_token() -> Result<librespot_oauth::OAuthToken, SessionError> {
-    let client = oauth_client()?;
-    if let Ok(rt) = std::fs::read_to_string(refresh_token_path()) {
-        let rt = rt.trim();
-        if !rt.is_empty() {
-            match client.refresh_token(rt) {
-                Ok(tok) => {
-                    save_refresh_token(&tok.refresh_token);
-                    return Ok(tok);
-                }
-                Err(e) => tracing::warn!("stored refresh token rejected ({e}) — re-authorizing"),
+    if let Some(stored) = load_token() {
+        if stored.expires_at_unix > now_unix() + 60 {
+            tracing::info!("using cached access token (no refresh spent)");
+            return Ok(librespot_oauth::OAuthToken {
+                access_token: stored.access_token,
+                refresh_token: stored.refresh_token,
+                expires_at: std::time::Instant::now()
+                    + std::time::Duration::from_secs(stored.expires_at_unix - now_unix()),
+                token_type: "Bearer".into(),
+                scopes: OAUTH_SCOPES.iter().map(|s| s.to_string()).collect(),
+            });
+        }
+
+        let client = oauth_client()?;
+        match client.refresh_token(&stored.refresh_token) {
+            Ok(tok) => {
+                tracing::info!("refreshed access token");
+                save_token(&tok);
+                return Ok(tok);
             }
+            Err(e) => tracing::warn!("stored refresh token rejected ({e}) — re-authorizing"),
         }
     }
-    let tok = client
+
+    let tok = oauth_client()?
         .get_access_token()
         .map_err(|e| SessionError::OAuth(e.to_string()))?;
-    save_refresh_token(&tok.refresh_token);
+    save_token(&tok);
     Ok(tok)
 }
 
@@ -362,7 +414,7 @@ impl NocturneHandle {
             })
             .await
             .map_err(|e| SessionError::OAuth(e.to_string()))??;
-            save_refresh_token(&fresh.refresh_token);
+            save_token(&fresh);
             *tok = fresh;
         }
         Ok(tok.access_token.clone())
