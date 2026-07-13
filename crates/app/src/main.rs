@@ -256,11 +256,23 @@ impl App {
                             let st = self.state.lock().unwrap();
                             (st.autoplay, st.radio_loading)
                         };
+                        let trained = self.state.lock().unwrap().taste_trained;
+                        let label = if trained >= 3 {
+                            format!("Radio ({trained})")
+                        } else {
+                            "Radio".to_string()
+                        };
                         if ui
-                            .checkbox(&mut autoplay, "Radio")
-                            .on_hover_text(
-                                "When the queue runs out, keep playing similar tracks (Spotify radio)",
-                            )
+                            .checkbox(&mut autoplay, label)
+                            .on_hover_text(if trained >= 3 {
+                                format!(
+                                    "When the queue runs out, keep playing — ordered by a model \
+                                     trained on {trained} of your playlists and listening runs"
+                                )
+                            } else {
+                                "When the queue runs out, keep playing similar tracks (Spotify radio)"
+                                    .to_string()
+                            })
                             .changed()
                         {
                             self.send(Cmd::SetAutoplay(autoplay));

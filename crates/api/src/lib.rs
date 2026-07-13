@@ -30,6 +30,12 @@ pub struct Track {
     pub duration_ms: u32,
     /// Smallest available cover, for the row thumbnail / now-playing art.
     pub art_url: Option<String>,
+    /// Signals for the taste model. Optional because the two metadata sources (Web API and
+    /// librespot) don't always carry them.
+    #[serde(default)]
+    pub popularity: Option<u32>,
+    #[serde(default)]
+    pub explicit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +253,10 @@ struct RawTrack {
     artists: Vec<Named>,
     album: Album,
     duration_ms: u32,
+    #[serde(default)]
+    popularity: Option<u32>,
+    #[serde(default)]
+    explicit: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +297,8 @@ impl From<RawTrack> for Track {
             album: t.album.name,
             duration_ms: t.duration_ms,
             art_url,
+            popularity: t.popularity,
+            explicit: t.explicit,
         }
     }
 }

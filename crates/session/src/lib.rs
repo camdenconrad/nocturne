@@ -81,6 +81,8 @@ fn to_api_track(t: librespot_metadata::Track) -> nocturne_api::Track {
         album: t.album.name,
         duration_ms: t.duration.max(0) as u32,
         art_url,
+        popularity: Some(t.popularity.clamp(0, 100) as u32),
+        explicit: Some(t.is_explicit),
     }
 }
 

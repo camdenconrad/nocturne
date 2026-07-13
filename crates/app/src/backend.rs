@@ -5,6 +5,7 @@
 //! sends [`Cmd`]s; it never awaits anything.
 
 use crate::cache;
+use nocturne_taste::Taste;
 use nocturne_api::{Client, Playlist, Track};
 use nocturne_session::NocturneHandle;
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,8 @@ pub enum Cmd {
     Volume(f32),
     /// Turn radio (autoplay past the end of the queue) on or off.
     SetAutoplay(bool),
+    /// Rebuild the taste model from cached playlists (fired once after they load).
+    TrainTaste,
 }
 
 #[derive(Default, Clone)]
@@ -69,6 +72,9 @@ pub struct State {
     pub autoplay: bool,
     /// Set while the radio is being fetched, so the UI can say so.
     pub radio_loading: bool,
+    /// How many sequences the taste model has learned — 0 means it's cold and radio falls back to
+    /// Spotify's own ordering.
+    pub taste_trained: usize,
     /// Decoded art bytes keyed by URL; the UI turns these into textures once.
     pub art: std::collections::HashMap<String, Vec<u8>>,
 }
@@ -87,6 +93,7 @@ impl Default for State {
             volume: 1.0,
             autoplay: true,
             radio_loading: false,
+            taste_trained: 0,
             art: Default::default(),
         }
     }
@@ -127,6 +134,12 @@ async fn run(
     // advances through the playlist instead of falling silent.
     let mut queue: Vec<Track> = Vec::new();
     let mut qpos: usize = 0;
+    // Learned autoplay. Rebuilt from the on-disk playlist cache at startup rather than persisted:
+    // the tree has no serialization, and it trains fast enough that the cache IS the model.
+    let mut taste = Taste::new();
+    // The current listening run, with how much of each track was actually heard. A skip is the
+    // only negative signal we get without asking the user anything.
+    let mut run: Vec<(Track, f32)> = Vec::new();
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -207,6 +220,9 @@ async fn run(
                         Ok(p) => {
                             tracing::info!("loaded {} playlists", p.len());
                             cache::list_put("playlists", &p);
+                            // Train only once the list exists — firing this from startup raced the
+                            // load and trained on an empty playlist set.
+                            let _ = self_tx.send(Cmd::TrainTaste);
                             // Debug hook: NOCTURNE_OPEN=<name substring> opens one on startup, so
                             // the real in-app path can be exercised without a human clicking.
                             if let Ok(want) = std::env::var("NOCTURNE_OPEN") {
@@ -262,10 +278,15 @@ async fn run(
 
             Cmd::Play(uri) => {
                 if let Some(h) = &handle {
+                    record(&state, &mut run, &mut taste, &repaint);
                     // Whatever list is on screen becomes the queue, starting at the clicked track.
                     queue = state.lock().unwrap().tracks.clone();
                     qpos = queue.iter().position(|t| t.uri == uri).unwrap_or(0);
                     paused = false;
+                    if let Some(t) = queue.get(qpos) {
+                        taste.observe(t);
+                        run.push((t.clone(), 0.0));
+                    }
                     start(&state, &repaint, h, &queue, qpos);
                 }
             }
@@ -289,9 +310,14 @@ async fn run(
 
             Cmd::Next => {
                 if let Some(h) = &handle {
+                    record(&state, &mut run, &mut taste, &repaint);
                     if qpos + 1 < queue.len() {
                         qpos += 1;
                         paused = false;
+                        if let Some(t) = queue.get(qpos) {
+                            taste.observe(t);
+                            run.push((t.clone(), 0.0));
+                        }
                         start(&state, &repaint, h, &queue, qpos);
                     } else if state.lock().unwrap().autoplay && !queue.is_empty() {
                         // Queue is dry and radio is on: extend it from the track that just played,
@@ -306,6 +332,8 @@ async fn run(
                             .collect();
                         match radio(h, &seed, &prev).await {
                             Ok(more) if !more.is_empty() => {
+                                // Spotify picks the candidates; the taste model picks the order.
+                                let more = taste.rank(more);
                                 tracing::info!("radio: queued {} more tracks", more.len());
                                 set(&state, &repaint, |s| {
                                     s.radio_loading = false;
@@ -314,6 +342,10 @@ async fn run(
                                 queue.extend(more);
                                 qpos += 1;
                                 paused = false;
+                                if let Some(t) = queue.get(qpos) {
+                                    taste.observe(t);
+                                    run.push((t.clone(), 0.0));
+                                }
                                 start(&state, &repaint, h, &queue, qpos);
                             }
                             Ok(_) => {
@@ -369,6 +401,42 @@ async fn run(
                 set(&state, &repaint, |s| s.autoplay = on);
             }
 
+            Cmd::TrainTaste => {
+                // Playlists are curated orderings — a human already decided these tracks belong
+                // next to each other. That's the best free training data available, and it's
+                // already sitting in the cache, so this costs no network at all.
+                let ids: Vec<String> = state
+                    .lock()
+                    .unwrap()
+                    .playlists
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect();
+                let mut learned = 0usize;
+                for id in ids {
+                    if let Some(tracks) = cache::list_get::<Vec<Track>>(&id) {
+                        taste.learn_sequence(&tracks);
+                        learned += 1;
+                    }
+                }
+                // Liked Songs: not an ordering he chose, but a strong statement about what he
+                // likes at all. Learned as one sequence so its tracks enter the model's space.
+                if let Some(liked) = cache::list_get::<Vec<Track>>("liked") {
+                    taste.learn_sequence(&liked);
+                    learned += 1;
+                }
+
+                // Past listening runs, replayed with their outcomes.
+                if let Some(history) = cache::list_get::<Vec<Vec<(Track, f32)>>>("history") {
+                    for past in history.iter().take(50) {
+                        taste.learn_plays(past);
+                    }
+                }
+                let n = taste.trained_sequences();
+                tracing::info!("taste: trained on {learned} cached playlists ({n} sequences)");
+                set(&state, &repaint, |s| s.taste_trained = n);
+            }
+
             Cmd::Seek(ms) => {
                 if let Some(h) = &handle {
                     h.seek(ms);
@@ -381,6 +449,49 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+/// Close out the currently-playing track: how much of it did he actually hear? That fraction is
+/// the reward signal — a track skipped at 5% and one played to the end mean opposite things, and
+/// it's the only feedback available without ever asking him to rate anything.
+///
+/// Runs are learned (and persisted) once they're long enough to carry a pattern.
+fn record(
+    state: &Shared,
+    run: &mut Vec<(Track, f32)>,
+    taste: &mut Taste,
+    repaint: &(impl Fn() + Send),
+) {
+    let completion = {
+        let s = state.lock().unwrap();
+        match &s.now {
+            Some(n) if n.duration_ms > 0 => {
+                (n.elapsed_ms() as f32 / n.duration_ms as f32).clamp(0.0, 1.0)
+            }
+            _ => return,
+        }
+    };
+    if let Some(last) = run.last_mut() {
+        last.1 = completion;
+    }
+
+    // Learn in windows rather than waiting for the app to close — a session that's never cleanly
+    // exited would otherwise teach the model nothing.
+    if run.len() >= 4 {
+        taste.learn_plays(run);
+        let mut history: Vec<Vec<(Track, f32)>> =
+            cache::list_get("history").unwrap_or_default();
+        history.push(run.clone());
+        // Bound it: this is a training set, not an archive.
+        let len = history.len();
+        if len > 100 {
+            history.drain(..len - 100);
+        }
+        cache::list_put("history", &history);
+        let n = taste.trained_sequences();
+        set(state, repaint, |s| s.taste_trained = n);
+        run.clear();
     }
 }
 
