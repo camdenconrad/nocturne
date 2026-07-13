@@ -131,7 +131,7 @@ async fn run(
             Cmd::LoadSaved => {
                 if let Some(api) = api(&handle, &state, &repaint).await {
                     busy(&state, &repaint, "loading liked songs…".into());
-                    match api.saved_tracks(50, 0).await {
+                    match api.saved_tracks(2000).await {
                         Ok(t) => finish_tracks(&state, &repaint, t, &api).await,
                         Err(e) => fail(&state, &repaint, format!("liked songs: {e}")),
                     }
@@ -140,7 +140,7 @@ async fn run(
 
             Cmd::LoadPlaylists => {
                 if let Some(api) = api(&handle, &state, &repaint).await {
-                    match api.playlists(50).await {
+                    match api.playlists(500).await {
                         Ok(p) => set(&state, &repaint, |s| s.playlists = p),
                         Err(e) => fail(&state, &repaint, format!("playlists: {e}")),
                     }
@@ -150,7 +150,7 @@ async fn run(
             Cmd::OpenPlaylist(id) => {
                 if let Some(api) = api(&handle, &state, &repaint).await {
                     busy(&state, &repaint, "loading playlist…".into());
-                    match api.playlist_tracks(&id, 100).await {
+                    match api.playlist_tracks(&id, 2000).await {
                         Ok(t) => finish_tracks(&state, &repaint, t, &api).await,
                         Err(e) => fail(&state, &repaint, format!("playlist: {e}")),
                     }

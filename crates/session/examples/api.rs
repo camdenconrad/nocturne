@@ -17,13 +17,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {} — {} [{}]", t.name, t.artists, nocturne_api::fmt_duration(t.duration_ms));
     }
 
-    let liked = api.saved_tracks(5, 0).await?;
+    let liked = api.saved_tracks(5).await?;
     println!("\nliked songs → {} shown", liked.len());
     for t in &liked {
         println!("  {} — {}", t.name, t.artists);
     }
 
-    let pls = api.playlists(10).await?;
+    let pls = api.playlists(500).await?;
     println!("\nplaylists → {}", pls.len());
     for p in &pls {
         println!("  {} ({:?})", p.name, p.tracks);

@@ -77,19 +77,41 @@ impl Client {
         Ok(r.tracks.items.into_iter().map(Into::into).collect())
     }
 
-    /// The user's saved ("Liked Songs") tracks — one page.
-    pub async fn saved_tracks(&self, limit: u32, offset: u32) -> Result<Vec<Track>, ApiError> {
-        let url = format!("{API}/me/tracks?limit={limit}&offset={offset}");
-        let r: Page<SavedTrack> = self.get(&url).await?;
-        Ok(r.items.into_iter().filter_map(|s| s.track).map(Into::into).collect())
+    /// Walk every page of a paged endpoint. `max` is a sanity stop, not a feature — Spotify's
+    /// `limit` maxes out at 50, so a single request is never the whole library.
+    async fn get_all<T: for<'de> Deserialize<'de>>(
+        &self,
+        first: String,
+        max: usize,
+    ) -> Result<Vec<T>, ApiError> {
+        let mut url = Some(first);
+        let mut out = Vec::new();
+        while let Some(u) = url {
+            let page: Page<T> = self.get(&u).await?;
+            out.extend(page.items);
+            if out.len() >= max {
+                break;
+            }
+            url = page.next;
+        }
+        Ok(out)
     }
 
-    pub async fn playlists(&self, limit: u32) -> Result<Vec<Playlist>, ApiError> {
-        let url = format!("{API}/me/playlists?limit={limit}");
-        // Spotify sprinkles nulls and partial objects through this page (dead collaborative
-        // playlists, ones with no `tracks` block). One bad entry must not lose the whole library.
-        let r: Page<Option<RawPlaylist>> = self.get(&url).await?;
-        Ok(r.items
+    /// Every saved ("Liked Songs") track, following pagination.
+    pub async fn saved_tracks(&self, max: usize) -> Result<Vec<Track>, ApiError> {
+        let items: Vec<SavedTrack> = self.get_all(format!("{API}/me/tracks?limit=50"), max).await?;
+        Ok(items.into_iter().filter_map(|s| s.track).map(Into::into).collect())
+    }
+
+    /// Every playlist the user owns or follows.
+    ///
+    /// Spotify sprinkles nulls and partial objects through this page (dead collaborative
+    /// playlists, ones with no `tracks` block). One bad entry must not lose the whole library.
+    pub async fn playlists(&self, max: usize) -> Result<Vec<Playlist>, ApiError> {
+        let items: Vec<Option<RawPlaylist>> = self
+            .get_all(format!("{API}/me/playlists?limit=50"), max)
+            .await?;
+        Ok(items
             .into_iter()
             .flatten()
             .map(|p| Playlist {
@@ -100,11 +122,13 @@ impl Client {
             .collect())
     }
 
-    pub async fn playlist_tracks(&self, id: &str, limit: u32) -> Result<Vec<Track>, ApiError> {
-        let url = format!("{API}/playlists/{id}/tracks?limit={limit}");
-        let r: Page<PlaylistItem> = self.get(&url).await?;
+    /// Every track in a playlist, following pagination.
+    pub async fn playlist_tracks(&self, id: &str, max: usize) -> Result<Vec<Track>, ApiError> {
+        let items: Vec<PlaylistItem> = self
+            .get_all(format!("{API}/playlists/{id}/tracks?limit=50"), max)
+            .await?;
         // Local files and removed tracks come back as null — skip rather than blow up the page.
-        Ok(r.items.into_iter().filter_map(|i| i.track).map(Into::into).collect())
+        Ok(items.into_iter().filter_map(|i| i.track).map(Into::into).collect())
     }
 
     /// Raw image bytes for a cover URL (art lives on a CDN, not the API host).
@@ -139,6 +163,10 @@ struct SearchResp {
 #[derive(Deserialize)]
 struct Page<T> {
     items: Vec<T>,
+    /// Absolute URL of the next page, or null on the last one. Spotify caps `limit` at 50, so
+    /// anything that ignores this silently truncates a real library.
+    #[serde(default)]
+    next: Option<String>,
 }
 
 #[derive(Deserialize)]
