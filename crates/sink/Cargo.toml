@@ -1,0 +1,12 @@
+[package]
+name = "nocturne-sink"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Runic-native audio sink for Nocturne: librespot Sink impl speaking the protocol runic serves."
+
+[dependencies]
+librespot-playback.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

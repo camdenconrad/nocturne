@@ -1,0 +1,18 @@
+[package]
+name = "nocturne-session"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Nocturne's librespot wrapper: OAuth auth, player control, Connect device, metadata."
+
+[dependencies]
+librespot-core.workspace = true
+librespot-playback.workspace = true
+librespot-connect.workspace = true
+librespot-metadata.workspace = true
+librespot-discovery.workspace = true
+librespot-oauth.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

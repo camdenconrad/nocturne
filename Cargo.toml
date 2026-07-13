@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/session", "crates/sink", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Camden <camden@smsgbl.com>"]
+license = "MIT"
+
+[workspace.dependencies]
+# Git, not crates.io: the 0.6.0 release's build script uses the vergen 8 API but resolves
+# vergen-lib 9 today, so `cargo check` fails on a clean index. dev is ahead and builds.
+librespot-core = { git = "https://github.com/librespot-org/librespot", branch = "dev" }
+librespot-playback = { git = "https://github.com/librespot-org/librespot", branch = "dev", default-features = false }
+librespot-connect = { git = "https://github.com/librespot-org/librespot", branch = "dev" }
+librespot-metadata = { git = "https://github.com/librespot-org/librespot", branch = "dev" }
+librespot-discovery = { git = "https://github.com/librespot-org/librespot", branch = "dev" }
+librespot-oauth = { git = "https://github.com/librespot-org/librespot", branch = "dev" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"

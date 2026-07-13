@@ -1,0 +1,21 @@
+[package]
+name = "nocturne-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "nocturne — native Spotify client for Rune (eframe/wgpu + livewall-uikit theme)."
+
+[[bin]]
+name = "nocturne"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29.1", default-features = false, features = ["wgpu", "default_fonts", "wayland"] }
+egui = "0.29.1"
+livewall-uikit = { path = "../../../../RustroverProjects/livewall-studio/crates/uikit" }
+nocturne-session = { path = "../session" }
+nocturne-sink = { path = "../sink" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
