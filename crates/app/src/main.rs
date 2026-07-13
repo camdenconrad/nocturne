@@ -2,6 +2,7 @@ mod backend;
 mod cache;
 mod emoji;
 mod fonts;
+mod mpris;
 
 use backend::{Cmd, NowPlaying, Shared};
 use eframe::egui;
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 
 const SIDEBAR_W: f32 = 232.0;
 const ROW_H: f32 = 56.0;
-const BAR_H: f32 = 92.0;
+const BAR_H: f32 = 108.0;
 const ART: f32 = 40.0;
 
 fn main() -> eframe::Result<()> {
@@ -25,7 +26,8 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([860.0, 560.0])
-            .with_app_id("nocturne"),
+            .with_app_id("nocturne")
+            .with_icon(load_icon()),
         ..Default::default()
     };
 
@@ -36,15 +38,35 @@ fn main() -> eframe::Result<()> {
             fonts::install(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let (state, tx) = backend::spawn(move || ctx.request_repaint());
+            // Publish MPRIS so rtray shows Nocturne as the active player and media keys work.
+            mpris::spawn(state.clone(), tx.clone());
             Ok(Box::new(App::new(state, tx)))
         }),
     )
+}
+
+/// The window/taskbar icon — the same Rune-family art installed to hicolor.
+fn load_icon() -> egui::IconData {
+    const PNG: &[u8] = include_bytes!("../assets/../../../dist/nocturne-128.png");
+    match image::load_from_memory(PNG) {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (width, height) = (img.width(), img.height());
+            egui::IconData {
+                rgba: img.into_raw(),
+                width,
+                height,
+            }
+        }
+        Err(_) => egui::IconData::default(),
+    }
 }
 
 struct App {
     state: Shared,
     tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
     query: String,
+    mood: String,
     textures: HashMap<String, egui::TextureHandle>,
     emoji: emoji::Emoji,
     loaded: bool,
@@ -59,6 +81,7 @@ impl App {
             state,
             tx,
             query: String::new(),
+            mood: String::new(),
             textures: HashMap::new(),
             emoji: emoji::Emoji::new(),
             loaded: false,
@@ -285,6 +308,37 @@ impl App {
                     });
                 });
 
+                // --- mood radio: describe a vibe, get a station ---
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let m = ui.add(
+                        egui::TextEdit::singleline(&mut self.mood)
+                            .hint_text("Describe a vibe — “chill winter lofi”…")
+                            .desired_width(300.0)
+                            .margin(Margin::symmetric(10.0, 7.0)),
+                    );
+                    let go = m.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if go || ui.button("▶ Start radio").clicked() {
+                        if !self.mood.trim().is_empty() {
+                            self.send(Cmd::MoodRadio(self.mood.clone()));
+                        }
+                    }
+                    ui.add_space(6.0);
+                    // One-click vibes. These are the presets worth having on a rainy Sunday.
+                    for (label, phrase) in [
+                        ("🍂 cozy lofi", "chill autumn lofi cozy"),
+                        ("⚡ hype", "hype energetic workout"),
+                        ("🌧 sad", "sad melancholy acoustic"),
+                        ("🌙 late night", "dark moody night chill"),
+                        ("💃 party", "happy dance party"),
+                    ] {
+                        if chip(ui, label) {
+                            self.mood = phrase.to_string();
+                            self.send(Cmd::MoodRadio(phrase.to_string()));
+                        }
+                    }
+                });
+
                 ui.add_space(14.0);
                 let tracks = self.state.lock().unwrap().tracks.clone();
                 ui.horizontal(|ui| {
@@ -384,10 +438,21 @@ impl App {
             .exact_height(BAR_H)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(16, 15, 19))
+                    .fill(Color32::from_rgb(18, 16, 21))
                     .inner_margin(Margin::symmetric(18.0, 10.0)),
             )
             .show(ctx, |ui| {
+                // Hairline of accent along the top edge — separates the bar from the list without
+                // a hard border, and ties it to the Rune palette.
+                let r = ui.max_rect();
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(r.min.x - 18.0, r.min.y - 10.0),
+                        egui::pos2(r.max.x + 18.0, r.min.y - 8.0),
+                    ),
+                    Rounding::ZERO,
+                    Color32::from_rgb(52, 38, 30),
+                );
                 let Some(n) = now else {
                     ui.centered_and_justified(|ui| {
                         ui.label(RichText::new("nothing playing").weak());
@@ -396,11 +461,11 @@ impl App {
                 };
 
                 ui.horizontal(|ui| {
-                    // left: art + title
-                    self.art_or_placeholder(ui, ctx, n.art_url.as_ref(), 60.0);
-                    ui.add_space(12.0);
+                    // left: art + title. Bigger art — the album cover is the point.
+                    self.art_or_placeholder(ui, ctx, n.art_url.as_ref(), 76.0);
+                    ui.add_space(14.0);
                     ui.vertical(|ui| {
-                        ui.add_space(8.0);
+                        ui.add_space(14.0);
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.add_sized(
                             [220.0, 18.0],
@@ -486,6 +551,44 @@ impl App {
                 });
             });
     }
+}
+
+/// A rounded, glossy pill button — the mood presets.
+fn chip(ui: &mut egui::Ui, label: &str) -> bool {
+    let text = RichText::new(label).size(12.0);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(12.0),
+        theme::TEXT,
+    );
+    let size = Vec2::new(galley.size().x + 20.0, 26.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    let bg = if resp.hovered() {
+        Color32::from_rgb(52, 44, 38)
+    } else {
+        Color32::from_rgb(34, 31, 38)
+    };
+    ui.painter().rect_filled(rect, Rounding::same(13.0), bg);
+    // The gloss: a lighter top half, which is what makes a flat rectangle read as a physical pill.
+    let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.center().y));
+    ui.painter().rect_filled(
+        top,
+        Rounding {
+            nw: 13.0,
+            ne: 13.0,
+            sw: 0.0,
+            se: 0.0,
+        },
+        Color32::from_white_alpha(6),
+    );
+    ui.painter().rect_stroke(
+        rect,
+        Rounding::same(13.0),
+        Stroke::new(1.0, Color32::from_rgb(70, 58, 48)),
+    );
+    ui.put(rect, egui::Label::new(text).selectable(false));
+    resp.clicked()
 }
 
 /// A sidebar row that highlights when it's the active view.

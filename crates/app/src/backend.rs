@@ -29,6 +29,8 @@ pub enum Cmd {
     SetAutoplay(bool),
     /// Rebuild the taste model from cached playlists (fired once after they load).
     TrainTaste,
+    /// Start a radio from a mood phrase ("chill winter lofi vibes").
+    MoodRadio(String),
 }
 
 #[derive(Default, Clone)]
@@ -77,6 +79,8 @@ pub struct State {
     pub taste_trained: usize,
     /// Tracks with Spotify's real analysis attached.
     pub taste_features: usize,
+    /// True while the background analysis backfill is still running.
+    pub analyzing: bool,
     /// Decoded art bytes keyed by URL; the UI turns these into textures once.
     pub art: std::collections::HashMap<String, Vec<u8>>,
 }
@@ -97,6 +101,7 @@ impl Default for State {
             radio_loading: false,
             taste_trained: 0,
             taste_features: 0,
+            analyzing: false,
             art: Default::default(),
         }
     }
@@ -141,7 +146,12 @@ async fn run(
     // the tree has no serialization, and it trains fast enough that the cache IS the model.
     // A saved model skips retraining entirely; a missing or stale one (different embedding layout)
     // is rebuilt from the cache.
-    let mut taste = Taste::load(&cache::model_path()).unwrap_or_default();
+    // Behind a lock: the analysis backfill runs in the background while the app is in use. The
+    // user shouldn't wait on it, and it shouldn't wait on the user.
+    let taste: Arc<Mutex<Taste>> = Arc::new(Mutex::new(
+        Taste::load(&cache::model_path()).unwrap_or_default(),
+    ));
+    let mut backfilling = false;
     // The current listening run, with how much of each track was actually heard. A skip is the
     // only negative signal we get without asking the user anything.
     let mut run: Vec<(Track, f32)> = Vec::new();
@@ -195,6 +205,7 @@ async fn run(
 
             Cmd::LoadSaved => {
                 let (h, st, rp) = (handle.clone(), state.clone(), repaint.clone());
+                let tx2 = self_tx.clone();
                 tokio::spawn(async move {
                     set(&st, &rp, |s| s.view = "Liked Songs".into());
                     // Paint from disk first; the network refresh lands behind the visible list.
@@ -208,6 +219,13 @@ async fn run(
                         match api.saved_tracks(5000).await {
                             Ok(t) => {
                                 cache::list_put("liked", &t);
+                                // Debug hook: play the first track automatically, so time-to-audio
+                                // can be measured without a human clicking.
+                                if std::env::var_os("NOCTURNE_PLAY_FIRST").is_some() {
+                                    if let Some(first) = t.first() {
+                                        let _ = tx2.send(Cmd::Play(first.uri.clone()));
+                                    }
+                                }
                                 finish_tracks(&st, &rp, t, &api).await
                             }
                             Err(e) => fail(&st, &rp, format!("liked songs: {e}")),
@@ -283,13 +301,13 @@ async fn run(
 
             Cmd::Play(uri) => {
                 if let Some(h) = &handle {
-                    record(&state, &mut run, &mut taste, &repaint);
+                    record(&state, &mut run, &taste, &repaint);
                     // Whatever list is on screen becomes the queue, starting at the clicked track.
                     queue = state.lock().unwrap().tracks.clone();
                     qpos = queue.iter().position(|t| t.uri == uri).unwrap_or(0);
                     paused = false;
                     if let Some(t) = queue.get(qpos) {
-                        taste.observe(t);
+                        taste.lock().unwrap().observe(t);
                         run.push((t.clone(), 0.0));
                     }
                     start(&state, &repaint, h, &queue, qpos);
@@ -315,12 +333,12 @@ async fn run(
 
             Cmd::Next => {
                 if let Some(h) = &handle {
-                    record(&state, &mut run, &mut taste, &repaint);
+                    record(&state, &mut run, &taste, &repaint);
                     if qpos + 1 < queue.len() {
                         qpos += 1;
                         paused = false;
                         if let Some(t) = queue.get(qpos) {
-                            taste.observe(t);
+                            taste.lock().unwrap().observe(t);
                             run.push((t.clone(), 0.0));
                         }
                         start(&state, &repaint, h, &queue, qpos);
@@ -338,7 +356,7 @@ async fn run(
                         match radio(h, &seed, &prev).await {
                             Ok(more) if !more.is_empty() => {
                                 // Spotify picks the candidates; the taste model picks the order.
-                                let more = taste.rank(more);
+                                let more = taste.lock().unwrap().rank(more);
                                 tracing::info!("radio: queued {} more tracks", more.len());
                                 set(&state, &repaint, |s| {
                                     s.radio_loading = false;
@@ -348,7 +366,7 @@ async fn run(
                                 qpos += 1;
                                 paused = false;
                                 if let Some(t) = queue.get(qpos) {
-                                    taste.observe(t);
+                                    taste.lock().unwrap().observe(t);
                                     run.push((t.clone(), 0.0));
                                 }
                                 start(&state, &repaint, h, &queue, qpos);
@@ -402,12 +420,69 @@ async fn run(
                 }
             }
 
+            Cmd::MoodRadio(phrase) => {
+                let (m, understood) = nocturne_taste::mood::parse(&phrase);
+                if !understood {
+                    fail(
+                        &state,
+                        &repaint,
+                        format!("don't know that mood — try words like chill, hype, sad, lofi, winter"),
+                    );
+                    continue;
+                }
+                let target = nocturne_taste::mood::acoustic_vec(&m.to_features());
+
+                // The pool is his own library — a mood radio should play HIS music, not strangers'.
+                let mut pool: Vec<Track> = cache::list_get("liked").unwrap_or_default();
+                let ids: Vec<String> = state
+                    .lock()
+                    .unwrap()
+                    .playlists
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect();
+                for id in ids {
+                    if let Some(ts) = cache::list_get::<Vec<Track>>(&id) {
+                        pool.extend(ts);
+                    }
+                }
+
+                let picks = taste.lock().unwrap().nearest_mood(&pool, &target, 60);
+                if picks.is_empty() {
+                    fail(&state, &repaint, "no analyzed tracks yet — still learning".into());
+                    continue;
+                }
+                tracing::info!("mood “{phrase}” → {} tracks", picks.len());
+                set(&state, &repaint, |s| {
+                    s.view = format!("Mood: {phrase}");
+                    s.status = format!("{} tracks", picks.len());
+                    s.busy = false;
+                    s.tracks = picks.clone();
+                });
+
+                // Fetch art for the new list, then start playing it immediately.
+                if let Some(api) = api(&handle, &state, &repaint).await {
+                    finish_tracks(&state, &repaint, picks.clone(), &api).await;
+                }
+                if let Some(h) = &handle {
+                    queue = picks;
+                    qpos = 0;
+                    paused = false;
+                    if let Some(t) = queue.first() {
+                        taste.lock().unwrap().observe(t);
+                        run.push((t.clone(), 0.0));
+                    }
+                    start(&state, &repaint, h, &queue, qpos);
+                }
+            }
+
             Cmd::SetAutoplay(on) => {
                 set(&state, &repaint, |s| s.autoplay = on);
             }
 
             Cmd::TrainTaste => {
-                let already = taste.trained_sequences();
+                let mut t = taste.lock().unwrap();
+                let already = t.trained_sequences();
                 // Playlists are curated orderings — a human already decided these tracks belong
                 // next to each other. That's the best free training data available, and it's
                 // already sitting in the cache, so this costs no network at all.
@@ -420,19 +495,19 @@ async fn run(
                     .collect();
                 let mut learned = 0usize;
                 for id in ids {
-                    if taste.has_learned(&id) {
+                    if t.has_learned(&id) {
                         continue;
                     }
                     if let Some(tracks) = cache::list_get::<Vec<Track>>(&id) {
-                        taste.learn_corpus(&id, &tracks);
+                        t.learn_corpus(&id, &tracks);
                         learned += 1;
                     }
                 }
                 // Liked Songs: not an ordering he chose, but a strong statement about what he
                 // likes at all. Learned as one sequence so its tracks enter the model's space.
-                if !taste.has_learned("liked") {
+                if !t.has_learned("liked") {
                     if let Some(liked) = cache::list_get::<Vec<Track>>("liked") {
-                        taste.learn_corpus("liked", &liked);
+                        t.learn_corpus("liked", &liked);
                         learned += 1;
                     }
                 }
@@ -440,10 +515,10 @@ async fn run(
                 // Past listening runs, replayed with their outcomes.
                 if let Some(history) = cache::list_get::<Vec<Vec<(Track, f32)>>>("history") {
                     for past in history.iter().take(50) {
-                        taste.learn_plays(past);
+                        t.learn_plays(past);
                     }
                 }
-                let n = taste.trained_sequences();
+                let n = t.trained_sequences();
                 tracing::info!(
                     "taste: trained on {learned} cached playlists ({n} sequences, was {already})"
                 );
@@ -451,40 +526,24 @@ async fn run(
                 // Fetch Spotify's REAL audio features for everything we know about — energy,
                 // valence, tempo. The Web API 403s these; the internal service serves them. They're
                 // immutable per track, so once they're in the model file we never fetch them again.
+                // Backfill runs in the BACKGROUND, for the whole library, while he uses the app —
+                // no cap and no waiting at startup. Analysis is immutable per track, so once a
+                // track lands in the model file it's never fetched again: this converges and stops.
                 if let Some(h) = handle.clone() {
-                    let (st, rp) = (state.clone(), repaint.clone());
-                    let known: Vec<String> = {
-                        let s = st.lock().unwrap();
-                        let mut ids: Vec<String> = s
-                            .tracks
-                            .iter()
-                            .map(|t| nocturne_taste::track_id(&t.uri).to_string())
-                            .collect();
-                        ids.sort();
-                        ids.dedup();
-                        ids
-                    };
-                    let missing: Vec<String> = known
-                        .into_iter()
-                        .filter(|id| !taste.features().contains_key(id))
-                        .take(400)
-                        .collect();
-                    if !missing.is_empty() {
-                        tracing::info!("taste: fetching analysis for {} tracks", missing.len());
-                        let got = h.audio_features_many(&missing).await;
-                        tracing::info!("taste: got analysis for {}/{}", got.len(), missing.len());
-                        taste.add_features(got.into_iter().collect());
-                        let _ = rp;
+                    if !backfilling {
+                        backfilling = true;
+                        spawn_backfill(h, taste.clone(), state.clone(), repaint.clone());
                     }
                 }
 
-                let n = taste.trained_sequences();
-                if let Err(e) = taste.save(&cache::model_path()) {
+                if let Err(e) = t.save(&cache::model_path()) {
                     tracing::warn!("taste: could not save model: {e}");
                 }
+                let f = t.feature_count();
+                drop(t);
                 set(&state, &repaint, |s| {
                     s.taste_trained = n;
-                    s.taste_features = taste.feature_count();
+                    s.taste_features = f;
                 });
             }
 
@@ -511,7 +570,7 @@ async fn run(
 fn record(
     state: &Shared,
     run: &mut Vec<(Track, f32)>,
-    taste: &mut Taste,
+    taste: &Arc<Mutex<Taste>>,
     repaint: &(impl Fn() + Send),
 ) {
     let completion = {
@@ -530,7 +589,8 @@ fn record(
     // Learn in windows rather than waiting for the app to close — a session that's never cleanly
     // exited would otherwise teach the model nothing.
     if run.len() >= 4 {
-        taste.learn_plays(run);
+        let mut t = taste.lock().unwrap();
+        t.learn_plays(run);
         let mut history: Vec<Vec<(Track, f32)>> =
             cache::list_get("history").unwrap_or_default();
         history.push(run.clone());
@@ -540,13 +600,98 @@ fn record(
             history.drain(..len - 100);
         }
         cache::list_put("history", &history);
-        if let Err(e) = taste.save(&cache::model_path()) {
+        if let Err(e) = t.save(&cache::model_path()) {
             tracing::warn!("taste: could not save model: {e}");
         }
-        let n = taste.trained_sequences();
+        let n = t.trained_sequences();
+        drop(t);
         set(state, repaint, |s| s.taste_trained = n);
         run.clear();
     }
+}
+
+/// Backfill Spotify's real audio analysis for the entire library, in the background.
+///
+/// Every track in every cached list, in chunks, until nothing is left to fetch. It runs while the
+/// app is in use rather than making him wait at startup for a 2000-track sweep — the model simply
+/// gets sharper as he listens. Analysis is immutable per track, so once a track is in the model
+/// file it's never fetched again: this converges and then stops for good.
+///
+/// The model is saved after every chunk, so quitting mid-backfill keeps the work done so far.
+fn spawn_backfill(
+    h: Arc<NocturneHandle>,
+    taste: Arc<Mutex<Taste>>,
+    state: Shared,
+    repaint: impl Fn() + Send + Sync + Clone + 'static,
+) {
+    tokio::spawn(async move {
+        let mut corpora: Vec<String> = vec!["liked".to_string()];
+        corpora.extend(state.lock().unwrap().playlists.iter().map(|p| p.id.clone()));
+
+        let mut ids: Vec<String> = Vec::new();
+        for key in corpora {
+            if let Some(tracks) = cache::list_get::<Vec<Track>>(&key) {
+                ids.extend(
+                    tracks
+                        .iter()
+                        .map(|t| nocturne_taste::track_id(&t.uri).to_string()),
+                );
+            }
+        }
+        ids.sort();
+        ids.dedup();
+
+        let todo: Vec<String> = {
+            let t = taste.lock().unwrap();
+            ids.into_iter()
+                .filter(|id| !t.features().contains_key(id))
+                .collect()
+        };
+        if todo.is_empty() {
+            tracing::info!("taste: analysis already complete");
+            return;
+        }
+
+        let total = todo.len();
+        tracing::info!("taste: backfilling analysis for {total} tracks (background)");
+        set(&state, &repaint, |s| s.analyzing = true);
+
+        let mut done = 0usize;
+        let chunks: Vec<_> = todo.chunks(100).collect();
+        let last = chunks.len().saturating_sub(1);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let got = h.audio_features_many(chunk).await;
+            done += chunk.len();
+
+            // Checkpoint every 5 chunks (and at the end) rather than every chunk — and never hold
+            // the model lock across the disk write. Play needs this lock; a 6MB write under it is
+            // exactly why starting a track stalled while the backfill ran.
+            let checkpoint = i % 5 == 0 || i == last;
+            let (f, bytes) = {
+                let mut t = taste.lock().unwrap();
+                t.add_features(got.into_iter().collect());
+                let bytes = if checkpoint { t.to_bytes().ok() } else { None };
+                (t.feature_count(), bytes)
+            };
+            if let Some(bytes) = bytes {
+                let path = cache::model_path();
+                // Off the async worker entirely: this is blocking file IO.
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = Taste::write_bytes(&path, &bytes) {
+                        tracing::warn!("taste: could not save model: {e}");
+                    }
+                })
+                .await;
+            }
+            set(&state, &repaint, |s| {
+                s.taste_features = f;
+                s.analyzing = done < total;
+            });
+            tracing::info!("taste: analysis {done}/{total} ({f} known)");
+        }
+        set(&state, &repaint, |s| s.analyzing = false);
+        tracing::info!("taste: analysis backfill COMPLETE ({total} tracks)");
+    });
 }
 
 /// Ask Spotify's radio for tracks that follow on from `seed`.
@@ -574,6 +719,9 @@ fn stop_playback(state: &Shared, repaint: &(impl Fn() + Send), h: &Arc<NocturneH
 }
 
 /// Load queue[i] and reflect it in the UI immediately (don't wait for the player event).
+///
+/// Timing is logged: time-to-audio is the number that decides whether this app feels native or
+/// feels like a webapp, so it's measured, not assumed.
 fn start(
     state: &Shared,
     repaint: &(impl Fn() + Send),
@@ -594,8 +742,12 @@ fn start(
             since: Some(Instant::now()),
         });
     });
+    let t0 = Instant::now();
     match librespot_uri(&t.uri) {
-        Ok(u) => h.play_uri(u),
+        Ok(u) => {
+            h.play_uri(u);
+            tracing::info!("play: dispatched in {}ms", t0.elapsed().as_millis());
+        }
         Err(e) => fail(state, repaint, e),
     }
 }
@@ -615,6 +767,7 @@ fn spawn_event_pump(
             if let Some(n) = &mut s.now {
                 match e {
                     PlayerEvent::Playing { position_ms, .. } => {
+                        tracing::info!("play: AUDIO STARTED (position {position_ms}ms)");
                         n.paused = false;
                         n.position_ms = position_ms;
                         n.since = Some(Instant::now());

@@ -236,14 +236,24 @@ impl NocturneHandle {
     ///
     /// Auth is driven by our own PKCE token, whose refresh token is cached under
     /// `~/.cache/nocturne` (Spotify gives it a 180-day life). So the browser consent screen
-    /// appears once, and later starts silently refresh. Audio files are deliberately *not*
-    /// cached — offline is out of scope.
+    /// appears once, and later starts silently refresh. Audio is cached too (8 GiB cap), so a
+    /// replayed track comes off the disk instead of the network.
     pub async fn login(
         make_sink: impl FnMut() -> Box<dyn librespot_playback::audio_backend::Sink> + Send + 'static,
     ) -> Result<Self, SessionError> {
         let cache_dir = dirs_cache().join("nocturne");
-        let cache = Cache::new(Some(&cache_dir), Some(&cache_dir), None, None)
-            .map_err(|e| SessionError::Connect(e.to_string()))?;
+        // Audio files ARE cached now (4th arg): replaying a track should hit the disk, not the
+        // network. Bounded at 8 GiB so it can't eat the disk — librespot evicts least-recently-used
+        // beyond that. Encrypted Ogg exactly as Spotify served it.
+        let audio_dir = cache_dir.join("audio");
+        const AUDIO_CACHE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
+        let cache = Cache::new(
+            Some(&cache_dir),
+            Some(&cache_dir),
+            Some(&audio_dir),
+            Some(AUDIO_CACHE_LIMIT),
+        )
+        .map_err(|e| SessionError::Connect(e.to_string()))?;
 
         // librespot-oauth is blocking and spins up its own runtime internally; calling it straight
         // from async panics on drop ("cannot drop a runtime in a context where blocking is not
@@ -453,8 +463,13 @@ impl NocturneHandle {
             .map_err(|e| SessionError::Connect(format!("audio features parse: {e}")))
     }
 
-    /// Features for many tracks, bounded-concurrent. Returns only what resolved — a track without
-    /// analysis (rare, but local files and some new releases lack it) is skipped, not fatal.
+    /// Features for many tracks.
+    ///
+    /// Spotify throttles this service: at 8-way concurrency roughly 60% of requests failed and were
+    /// silently dropped, so a 2251-track sweep yielded 859 tracks. Serially it's 30/30. So: modest
+    /// concurrency, and — crucially — **retry with backoff** rather than discarding a track because
+    /// it happened to be throttled. A dropped track isn't a slow track, it's a permanently
+    /// feature-less one, and the model would never have learned it.
     pub async fn audio_features_many(
         &self,
         track_ids: &[String],
@@ -462,15 +477,23 @@ impl NocturneHandle {
         use futures_util::StreamExt;
         futures_util::stream::iter(track_ids.to_vec())
             .map(|id| async move {
-                match self.audio_features(&id).await {
-                    Ok(f) => Some((id, f)),
-                    Err(e) => {
-                        tracing::debug!("no features for {id}: {e}");
-                        None
+                for attempt in 0..4u32 {
+                    match self.audio_features(&id).await {
+                        Ok(f) => return Some((id, f)),
+                        Err(e) => {
+                            if attempt == 3 {
+                                tracing::debug!("no features for {id} after retries: {e}");
+                                return None;
+                            }
+                            // 200ms, 600ms, 1.8s — enough for a throttle window to clear.
+                            let backoff = 200 * 3u64.pow(attempt);
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        }
                     }
                 }
+                None
             })
-            .buffered(8)
+            .buffered(4)
             .filter_map(|x| async move { x })
             .collect()
             .await

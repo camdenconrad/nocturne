@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Nocturne
+GenericName=Music Player
+Comment=Spotify, native to Rune
+Exec=nocturne
+Icon=nocturne
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=nocturne

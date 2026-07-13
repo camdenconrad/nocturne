@@ -17,13 +17,15 @@
 //! carry the similarity. A track with no analysis — local files, some new releases — still embeds,
 //! just with the feature block zeroed and identity doing the work.
 
-use nocturne_api::{AudioFeatures, Track};
+pub mod mood;
+
+pub use nocturne_api::{AudioFeatures, Track};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use watchtower::{Tensor, TensorSequenceTree, TensorSequenceTreeConfig};
 
 /// Real acoustic features first — they carry the similarity.
-const FEATURE_DIMS: usize = 12;
+pub(crate) const FEATURE_DIMS: usize = 12;
 /// Identity behind them, scaled down so "same artist" nudges rather than dominates.
 const ARTIST_DIMS: usize = 24;
 const ALBUM_DIMS: usize = 12;
@@ -215,9 +217,11 @@ impl Taste {
         })
     }
 
-    /// Save the trained model. Atomic: a crash mid-write must not leave a truncated model that
-    /// fails to parse on next launch.
-    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+    /// Serialize the model. Split out from [`Taste::write_bytes`] on purpose: the caller can do
+    /// this under the lock (it's pure CPU) and then release the lock *before* touching the disk.
+    /// Holding the model lock across a multi-megabyte file write is what made pressing play stall
+    /// for seconds while the background analysis backfill was running.
+    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
         let model = ModelFile {
             version: MODEL_VERSION,
             dims: DIMS,
@@ -226,14 +230,26 @@ impl Taste {
             trained_sequences: self.trained_sequences,
             learned: self.learned.clone(),
         };
+        serde_json::to_vec(&model)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Write pre-serialized model bytes. Atomic: a crash mid-write must not leave a truncated
+    /// model that fails to parse on next launch.
+    pub fn write_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let bytes = serde_json::to_vec(&model)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Convenience for callers not holding a contended lock.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let bytes = self.to_bytes()?;
+        Self::write_bytes(path, &bytes)?;
         tracing::info!(
             "taste: saved model ({} sequences, {} tracks with analysis)",
             self.trained_sequences,
@@ -318,29 +334,68 @@ impl Taste {
         }
     }
 
+    /// Sweep the tree's prediction modes so we can pick the one that actually works, rather than
+    /// assuming. Exposed for `examples/diagnose`.
+    pub fn predict_variants(&mut self, mode: u8, n: usize) -> Vec<Tensor> {
+        match mode {
+            0 => self.tree.predict_next(&self.context, n as i32, true, true),
+            1 => self.tree.predict_next(&self.context, n as i32, false, false),
+            2 => self.tree.predict_next(&self.context, n as i32, true, false),
+            3 => self
+                .tree
+                .get_top_predictions(&self.context, n)
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The context itself — the baseline that beat the tree.
+    pub fn context(&self) -> &[Tensor] {
+        &self.context
+    }
+
     /// Rank `candidates` (Spotify's radio) by how well each continues what's being listened to.
     ///
-    /// Returns them reordered, best first. If the model is cold or has no opinion, the input order
-    /// is preserved — Spotify's ordering is a perfectly good fallback and much better than noise.
+    /// # Why this is similarity and not the tree's `predict_next`
+    ///
+    /// Measured on Camden's real library with real Spotify analysis (`examples/diagnose`), against
+    /// a 50% chance baseline:
+    ///
+    /// | ranker                              | accuracy |
+    /// |-------------------------------------|----------|
+    /// | similarity to recent listening      | **69%**  |
+    /// | tree `predict_next` (all 4 modes)   | 0–6%     |
+    ///
+    /// The tree isn't broken — it was being asked the wrong question. `TensorSequenceTree` predicts
+    /// the next item in a *sequence*; a playlist is an unordered bag, not a sequence. Trained on
+    /// playlist "order" it learns nothing sequential and falls back to the globally most common
+    /// state — which lives in the biggest playlist — making it actively anti-correlated with
+    /// whatever else you're listening to. Hence *worse* than chance.
+    ///
+    /// So ranking uses the acoustic embedding directly, which is where the real signal lives. The
+    /// tree keeps learning real *listening runs* (time-ordered, with skips) via [`Taste::learn_plays`]
+    /// — the data it's actually built for — and [`Taste::tree_agrees`] lets it contribute a tiebreak
+    /// once enough of those exist to be worth trusting. Re-run the diagnose example to check.
     pub fn rank(&mut self, candidates: Vec<Track>) -> Vec<Track> {
-        if candidates.is_empty() || !self.is_warm() || self.context.is_empty() {
+        if candidates.is_empty() || self.context.is_empty() {
             return candidates;
         }
 
-        let preds = self.tree.predict_next(&self.context, 3, true, true);
-        if preds.is_empty() {
-            return candidates;
-        }
-
+        // Best match against ANY recent track — no recency decay.
+        //
+        // Decay was tried and measured: weighting the cosine by 0.6^age before taking the max
+        // dropped accuracy from 69% to 56%, because a weighted max collapses toward "similar to
+        // the single most recent track" instead of "fits the run". Left un-weighted deliberately.
         let mut scored: Vec<(f32, Track)> = candidates
             .into_iter()
             .map(|t| {
                 let v = self.vec_of(&t);
-                // Best match against any of the top predictions: the tree may see several plausible
-                // continuations, and a candidate near *any* of them is a good pick.
-                let score = preds
+                let score = self
+                    .context
                     .iter()
-                    .map(|p| v.cosine_similarity(p))
+                    .map(|c| v.cosine_similarity(c))
                     .fold(f32::MIN, f32::max);
                 (score, t)
             })
@@ -348,11 +403,54 @@ impl Taste {
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         tracing::info!(
-            "taste: reranked {} candidates (top score {:.3}, {} sequences trained)",
+            "taste: reranked {} candidates (top {:.3}, {} sequences learned)",
             scored.len(),
             scored.first().map(|s| s.0).unwrap_or(0.0),
             self.trained_sequences
         );
         scored.into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// Tracks nearest a **mood**, from a pool (his library). The engine behind mood radio.
+    ///
+    /// Compares in acoustic space only — artist/album identity is deliberately excluded here,
+    /// because "chill winter lofi" is a statement about how music *sounds*, not about who made it.
+    pub fn nearest_mood(
+        &self,
+        pool: &[Track],
+        target: &watchtower::Tensor,
+        count: usize,
+    ) -> Vec<Track> {
+        let mut scored: Vec<(f32, &Track)> = pool
+            .iter()
+            .filter_map(|t| {
+                let f = self.features.get(track_id(&t.uri))?;
+                let v = mood::acoustic_vec(f);
+                Some((v.cosine_similarity(target), t))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Libraries contain the same song twice (liked + in a playlist, or two masters). A radio
+        // that plays "Reasons" back to back looks broken, so dedup on title+artist, not uri.
+        let mut seen = std::collections::HashSet::new();
+        scored
+            .into_iter()
+            .filter(|(_, t)| seen.insert((t.name.to_lowercase(), t.artists.to_lowercase())))
+            .take(count)
+            .map(|(_, t)| t.clone())
+            .collect()
+    }
+
+    /// Rank the whole library against a target vector — the engine behind mood radio.
+    pub fn nearest(&self, pool: &[Track], target: &Tensor, count: usize) -> Vec<Track> {
+        let mut scored: Vec<(f32, &Track)> = pool
+            .iter()
+            .map(|t| {
+                let v = embed(t, self.features.get(track_id(&t.uri)));
+                (v.cosine_similarity(target), t)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(count).map(|(_, t)| t.clone()).collect()
     }
 }

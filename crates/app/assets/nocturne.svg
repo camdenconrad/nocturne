@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Nocturne — Rune-family icon.
+       Rune's palette: warm charcoal (#131216) ground, burnt orange (#e96e2c) accent,
+       matching livewall-uikit's theme::CHROME and theme::ORANGE so it sits beside the other r*
+       apps without looking like a stranger. A night sky (nocturne) with a crescent moon whose
+       curve doubles as a vinyl groove, and a single falling leaf for the autumn rice. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#241f2b"/>
+      <stop offset="100%" stop-color="#131216"/>
+    </linearGradient>
+    <linearGradient id="moon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f88c4a"/>
+      <stop offset="100%" stop-color="#e96e2c"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#e96e2c" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#e96e2c" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#sky)"/>
+  <rect x="4.5" y="4.5" width="119" height="119" rx="27.5" fill="none"
+        stroke="#e96e2c" stroke-opacity="0.28" stroke-width="1"/>
+
+  <circle cx="64" cy="62" r="46" fill="url(#glow)"/>
+
+  <!-- Vinyl grooves: concentric arcs, the record under the night. -->
+  <g fill="none" stroke="#e96e2c" stroke-opacity="0.20" stroke-width="1.5">
+    <circle cx="64" cy="62" r="38"/>
+    <circle cx="64" cy="62" r="31"/>
+    <circle cx="64" cy="62" r="24"/>
+  </g>
+
+  <!-- Crescent moon, cut from a disc — the record's label and the moon at once. -->
+  <path d="M64 22a40 40 0 1 0 30.5 65.8A34 34 0 0 1 64 22z" fill="url(#moon)"/>
+  <circle cx="64" cy="62" r="5" fill="#131216"/>
+
+  <!-- Falling leaf, autumn rice. -->
+  <path d="M96 34c-7 1-13 6-14 13 6 3 13 1 17-5 2-3 2-6-3-8z" fill="#f88c4a" opacity="0.9"/>
+  <path d="M96 34c-5 4-9 9-12 15" stroke="#131216" stroke-opacity="0.35" stroke-width="1.2" fill="none"/>
+
+  <!-- Two stars. -->
+  <circle cx="34" cy="30" r="2" fill="#eeebe8" opacity="0.85"/>
+  <circle cx="104" cy="72" r="1.6" fill="#eeebe8" opacity="0.6"/>
+</svg>
