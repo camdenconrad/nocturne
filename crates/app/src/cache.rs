@@ -63,6 +63,11 @@ pub fn list_get<T: DeserializeOwned>(key: &str) -> Option<T> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Where the trained taste model lives.
+pub fn model_path() -> PathBuf {
+    root().join("taste-model.json")
+}
+
 pub fn list_put<T: Serialize>(key: &str, value: &T) {
     let _ = std::fs::create_dir_all(list_dir());
     let Ok(bytes) = serde_json::to_vec(value) else {

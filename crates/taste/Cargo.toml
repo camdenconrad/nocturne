@@ -7,7 +7,9 @@ license.workspace = true
 description = "Learned autoplay for Nocturne: embeds tracks and ranks what to play next with WatchTower's TensorSequenceTree."
 
 [dependencies]
-watchtower = { package = "WatchTower", path = "../../../../RustroverProjects/WatchTower" }
+# default-features = false: WatchTower's default binary pulls a whole GUI/store stack we don't
+# want. "serde" is a feature we added there (default-off) so the trained tree can be saved.
+watchtower = { package = "WatchTower", path = "../../../../RustroverProjects/WatchTower", default-features = false, features = ["serde"] }
 nocturne-api = { path = "../api" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -431,6 +431,51 @@ impl NocturneHandle {
         self.tracks_batch(&uris[..uris.len().min(BATCH)]).await
     }
 
+    /// Spotify's **real** audio features (energy, valence, tempo, danceability…).
+    ///
+    /// The Web API's `/v1/audio-features` is 403 for our app — as is `/v1/audio-analysis` — but the
+    /// internal `/audio-attributes/v1/audio-features/{id}` service that the real client uses answers
+    /// happily over the authenticated spclient. This is the difference between a taste model that
+    /// guesses from artist names and one that knows a track is 0.94 energy at 113 BPM.
+    pub async fn audio_features(
+        &self,
+        track_id: &str,
+    ) -> Result<nocturne_api::AudioFeatures, SessionError> {
+        use http::Method;
+        let path = format!("/audio-attributes/v1/audio-features/{track_id}");
+        let bytes = self
+            .session
+            .spclient()
+            .request_as_json(&Method::GET, &path, None, None)
+            .await
+            .map_err(|e| SessionError::Connect(format!("audio features: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| SessionError::Connect(format!("audio features parse: {e}")))
+    }
+
+    /// Features for many tracks, bounded-concurrent. Returns only what resolved — a track without
+    /// analysis (rare, but local files and some new releases lack it) is skipped, not fatal.
+    pub async fn audio_features_many(
+        &self,
+        track_ids: &[String],
+    ) -> Vec<(String, nocturne_api::AudioFeatures)> {
+        use futures_util::StreamExt;
+        futures_util::stream::iter(track_ids.to_vec())
+            .map(|id| async move {
+                match self.audio_features(&id).await {
+                    Ok(f) => Some((id, f)),
+                    Err(e) => {
+                        tracing::debug!("no features for {id}: {e}");
+                        None
+                    }
+                }
+            })
+            .buffered(8)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await
+    }
+
     pub fn seek(&self, position_ms: u32) {
         self.player.seek(position_ms);
     }

@@ -38,6 +38,30 @@ pub struct Track {
     pub explicit: Option<bool>,
 }
 
+/// Spotify's real audio features — the ones that make a taste model actually work.
+///
+/// NOT available from the Web API: `/v1/audio-features` is 403 for post-2024 apps. These come from
+/// the *internal* `/audio-attributes/v1/audio-features/{id}` service instead (see
+/// `nocturne_session::NocturneHandle::audio_features`). Immutable per track, so they cache forever.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioFeatures {
+    pub danceability: f32,
+    pub energy: f32,
+    pub valence: f32,
+    pub acousticness: f32,
+    pub instrumentalness: f32,
+    pub speechiness: f32,
+    pub liveness: f32,
+    /// dB, typically -60..0.
+    pub loudness: f32,
+    /// BPM.
+    pub tempo: f32,
+    /// Pitch class 0-11, or -1 when undetected.
+    pub key: i32,
+    /// 1 = major, 0 = minor.
+    pub mode: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: String,

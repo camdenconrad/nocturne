@@ -75,6 +75,8 @@ pub struct State {
     /// How many sequences the taste model has learned — 0 means it's cold and radio falls back to
     /// Spotify's own ordering.
     pub taste_trained: usize,
+    /// Tracks with Spotify's real analysis attached.
+    pub taste_features: usize,
     /// Decoded art bytes keyed by URL; the UI turns these into textures once.
     pub art: std::collections::HashMap<String, Vec<u8>>,
 }
@@ -94,6 +96,7 @@ impl Default for State {
             autoplay: true,
             radio_loading: false,
             taste_trained: 0,
+            taste_features: 0,
             art: Default::default(),
         }
     }
@@ -136,7 +139,9 @@ async fn run(
     let mut qpos: usize = 0;
     // Learned autoplay. Rebuilt from the on-disk playlist cache at startup rather than persisted:
     // the tree has no serialization, and it trains fast enough that the cache IS the model.
-    let mut taste = Taste::new();
+    // A saved model skips retraining entirely; a missing or stale one (different embedding layout)
+    // is rebuilt from the cache.
+    let mut taste = Taste::load(&cache::model_path()).unwrap_or_default();
     // The current listening run, with how much of each track was actually heard. A skip is the
     // only negative signal we get without asking the user anything.
     let mut run: Vec<(Track, f32)> = Vec::new();
@@ -402,6 +407,7 @@ async fn run(
             }
 
             Cmd::TrainTaste => {
+                let already = taste.trained_sequences();
                 // Playlists are curated orderings — a human already decided these tracks belong
                 // next to each other. That's the best free training data available, and it's
                 // already sitting in the cache, so this costs no network at all.
@@ -414,16 +420,21 @@ async fn run(
                     .collect();
                 let mut learned = 0usize;
                 for id in ids {
+                    if taste.has_learned(&id) {
+                        continue;
+                    }
                     if let Some(tracks) = cache::list_get::<Vec<Track>>(&id) {
-                        taste.learn_sequence(&tracks);
+                        taste.learn_corpus(&id, &tracks);
                         learned += 1;
                     }
                 }
                 // Liked Songs: not an ordering he chose, but a strong statement about what he
                 // likes at all. Learned as one sequence so its tracks enter the model's space.
-                if let Some(liked) = cache::list_get::<Vec<Track>>("liked") {
-                    taste.learn_sequence(&liked);
-                    learned += 1;
+                if !taste.has_learned("liked") {
+                    if let Some(liked) = cache::list_get::<Vec<Track>>("liked") {
+                        taste.learn_corpus("liked", &liked);
+                        learned += 1;
+                    }
                 }
 
                 // Past listening runs, replayed with their outcomes.
@@ -433,8 +444,48 @@ async fn run(
                     }
                 }
                 let n = taste.trained_sequences();
-                tracing::info!("taste: trained on {learned} cached playlists ({n} sequences)");
-                set(&state, &repaint, |s| s.taste_trained = n);
+                tracing::info!(
+                    "taste: trained on {learned} cached playlists ({n} sequences, was {already})"
+                );
+
+                // Fetch Spotify's REAL audio features for everything we know about — energy,
+                // valence, tempo. The Web API 403s these; the internal service serves them. They're
+                // immutable per track, so once they're in the model file we never fetch them again.
+                if let Some(h) = handle.clone() {
+                    let (st, rp) = (state.clone(), repaint.clone());
+                    let known: Vec<String> = {
+                        let s = st.lock().unwrap();
+                        let mut ids: Vec<String> = s
+                            .tracks
+                            .iter()
+                            .map(|t| nocturne_taste::track_id(&t.uri).to_string())
+                            .collect();
+                        ids.sort();
+                        ids.dedup();
+                        ids
+                    };
+                    let missing: Vec<String> = known
+                        .into_iter()
+                        .filter(|id| !taste.features().contains_key(id))
+                        .take(400)
+                        .collect();
+                    if !missing.is_empty() {
+                        tracing::info!("taste: fetching analysis for {} tracks", missing.len());
+                        let got = h.audio_features_many(&missing).await;
+                        tracing::info!("taste: got analysis for {}/{}", got.len(), missing.len());
+                        taste.add_features(got.into_iter().collect());
+                        let _ = rp;
+                    }
+                }
+
+                let n = taste.trained_sequences();
+                if let Err(e) = taste.save(&cache::model_path()) {
+                    tracing::warn!("taste: could not save model: {e}");
+                }
+                set(&state, &repaint, |s| {
+                    s.taste_trained = n;
+                    s.taste_features = taste.feature_count();
+                });
             }
 
             Cmd::Seek(ms) => {
@@ -489,6 +540,9 @@ fn record(
             history.drain(..len - 100);
         }
         cache::list_put("history", &history);
+        if let Err(e) = taste.save(&cache::model_path()) {
+            tracing::warn!("taste: could not save model: {e}");
+        }
         let n = taste.trained_sequences();
         set(state, repaint, |s| s.taste_trained = n);
         run.clear();
