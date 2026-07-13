@@ -258,10 +258,22 @@ impl NocturneHandle {
         // metadata service, which rate-limits the whole session ("resource has been exhausted")
         // and then poisons every playlist opened afterwards. The batched entity endpoint is what
         // the real client uses, and it takes the whole chunk in one round trip.
+        // Batches run concurrently — a 350-track playlist is 4 requests, and issuing them serially
+        // costs 4 round trips for no reason. Bounded so we don't recreate the stampede that got
+        // the session rate-limited in the first place.
+        use futures_util::StreamExt;
         let uris: Vec<SpotifyUri> = list.tracks().cloned().collect();
+        let chunks: Vec<Vec<SpotifyUri>> = uris.chunks(BATCH).map(|c| c.to_vec()).collect();
+        let batches: Vec<Result<Vec<nocturne_api::Track>, SessionError>> =
+            futures_util::stream::iter(chunks)
+                .map(|chunk| async move { self.tracks_batch(&chunk).await })
+                .buffered(4)
+                .collect()
+                .await;
+
         let mut out = Vec::with_capacity(uris.len());
-        for chunk in uris.chunks(BATCH) {
-            out.extend(self.tracks_batch(chunk).await?);
+        for b in batches {
+            out.extend(b?);
         }
         Ok(out)
     }

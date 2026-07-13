@@ -2296,6 +2296,7 @@ dependencies = [
 name = "nocturne-api"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "reqwest",
  "serde",
  "thiserror 2.0.18",
@@ -2308,6 +2309,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "futures-util",
  "image",
  "librespot-core",
  "librespot-playback",
@@ -2315,6 +2317,8 @@ dependencies = [
  "nocturne-api",
  "nocturne-session",
  "nocturne-sink",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

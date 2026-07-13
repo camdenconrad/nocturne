@@ -4,6 +4,7 @@
 //! API calls, art fetches — happens here and lands in a shared [`State`] the UI just reads. The UI
 //! sends [`Cmd`]s; it never awaits anything.
 
+use crate::cache;
 use nocturne_api::{Client, Playlist, Track};
 use nocturne_session::NocturneHandle;
 use std::sync::{Arc, Mutex};
@@ -86,7 +87,7 @@ impl Default for State {
 pub type Shared = Arc<Mutex<State>>;
 
 /// Spawn the backend thread. Returns the shared state and the command sender.
-pub fn spawn(repaint: impl Fn() + Send + Clone + 'static) -> (Shared, mpsc::UnboundedSender<Cmd>) {
+pub fn spawn(repaint: impl Fn() + Send + Sync + Clone + 'static) -> (Shared, mpsc::UnboundedSender<Cmd>) {
     let state: Shared = Arc::new(Mutex::new(State {
         status: "not signed in".into(),
         ..Default::default()
@@ -110,7 +111,7 @@ async fn run(
     state: Shared,
     mut rx: mpsc::UnboundedReceiver<Cmd>,
     self_tx: mpsc::UnboundedSender<Cmd>,
-    repaint: impl Fn() + Send + Clone + 'static,
+    repaint: impl Fn() + Send + Sync + Clone + 'static,
 ) {
     let mut handle: Option<Arc<NocturneHandle>> = None;
     let mut paused = false;
@@ -149,43 +150,76 @@ async fn run(
             }
 
             Cmd::Search(q) if !q.trim().is_empty() => {
-                if let Some(api) = api(&handle, &state, &repaint).await {
-                    busy(&state, &repaint, format!("searching “{q}”…"));
-                    set(&state, &repaint, |s| s.view = format!("Search: {q}"));
-                    match api.search_tracks(&q, 50).await {
-                        Ok(t) => finish_tracks(&state, &repaint, t, &api).await,
-                        Err(e) => fail(&state, &repaint, format!("search: {e}")),
+                // Every fetch runs as its own task. On the command loop, one slow load (the
+                // 2000-track Liked Songs sweep at startup) blocks every later click behind it —
+                // which is exactly why opening a playlist "took forever".
+                let (h, st, rp) = (handle.clone(), state.clone(), repaint.clone());
+                tokio::spawn(async move {
+                    if let Some(api) = api(&h, &st, &rp).await {
+                        busy(&st, &rp, format!("searching “{q}”…"));
+                        set(&st, &rp, |s| s.view = format!("Search: {q}"));
+                        match api.search_tracks(&q, 50).await {
+                            Ok(t) => finish_tracks(&st, &rp, t, &api).await,
+                            Err(e) => fail(&st, &rp, format!("search: {e}")),
+                        }
                     }
-                }
+                });
             }
             Cmd::Search(_) => {}
 
             Cmd::LoadSaved => {
-                if let Some(api) = api(&handle, &state, &repaint).await {
-                    busy(&state, &repaint, "loading liked songs…".into());
-                    set(&state, &repaint, |s| s.view = "Liked Songs".into());
-                    match api.saved_tracks(2000).await {
-                        Ok(t) => finish_tracks(&state, &repaint, t, &api).await,
-                        Err(e) => fail(&state, &repaint, format!("liked songs: {e}")),
+                let (h, st, rp) = (handle.clone(), state.clone(), repaint.clone());
+                tokio::spawn(async move {
+                    set(&st, &rp, |s| s.view = "Liked Songs".into());
+                    // Paint from disk first; the network refresh lands behind the visible list.
+                    let cached: Option<Vec<Track>> = cache::list_get("liked");
+                    if let Some(t) = cached {
+                        show(&st, &rp, t);
+                    } else {
+                        busy(&st, &rp, "loading liked songs…".into());
                     }
-                }
+                    if let Some(api) = api(&h, &st, &rp).await {
+                        match api.saved_tracks(5000).await {
+                            Ok(t) => {
+                                cache::list_put("liked", &t);
+                                finish_tracks(&st, &rp, t, &api).await
+                            }
+                            Err(e) => fail(&st, &rp, format!("liked songs: {e}")),
+                        }
+                    }
+                });
             }
 
             Cmd::LoadPlaylists => {
+                if let Some(p) = cache::list_get::<Vec<Playlist>>("playlists") {
+                    set(&state, &repaint, |s| s.playlists = p);
+                }
                 if let Some(api) = api(&handle, &state, &repaint).await {
                     match api.playlists(500).await {
-                        Ok(p) => set(&state, &repaint, |s| s.playlists = p),
+                        Ok(p) => {
+                            tracing::info!("loaded {} playlists", p.len());
+                            cache::list_put("playlists", &p);
+                            // Debug hook: NOCTURNE_OPEN=<name substring> opens one on startup, so
+                            // the real in-app path can be exercised without a human clicking.
+                            if let Ok(want) = std::env::var("NOCTURNE_OPEN") {
+                                if let Some(hit) = p
+                                    .iter()
+                                    .find(|x| x.name.to_lowercase().contains(&want.to_lowercase()))
+                                {
+                                    let _ = self_tx.send(Cmd::OpenPlaylist(hit.id.clone()));
+                                }
+                            }
+                            set(&state, &repaint, |s| s.playlists = p);
+                        }
                         Err(e) => fail(&state, &repaint, format!("playlists: {e}")),
                     }
                 }
             }
 
             Cmd::OpenPlaylist(id) => {
-                // Playlist contents come from librespot's internal protocol, NOT the Web API,
-                // which 403s playlist tracks for post-2024 apps. Art still needs an HTTP fetch.
-                if let (Some(h), Some(api)) = (handle.clone(), api(&handle, &state, &repaint).await) {
-                    busy(&state, &repaint, "loading playlist…".into());
-                    let name = state
+                let (h, st, rp) = (handle.clone(), state.clone(), repaint.clone());
+                tokio::spawn(async move {
+                    let name = st
                         .lock()
                         .unwrap()
                         .playlists
@@ -193,12 +227,29 @@ async fn run(
                         .find(|p| p.id == id)
                         .map(|p| p.name.clone())
                         .unwrap_or_default();
-                    set(&state, &repaint, |s| s.view = name);
-                    match h.playlist_tracks(&id).await {
-                        Ok(t) => finish_tracks(&state, &repaint, t, &api).await,
-                        Err(e) => fail(&state, &repaint, format!("playlist: {e}")),
+                    set(&st, &rp, |s| s.view = name);
+
+                    if let Some(t) = cache::list_get::<Vec<Track>>(&id) {
+                        show(&st, &rp, t);
+                    } else {
+                        busy(&st, &rp, "loading playlist…".into());
                     }
-                }
+
+                    // Contents come from librespot's internal protocol, NOT the Web API, which
+                    // 403s playlist tracks for post-2024 apps. Art still needs an HTTP fetch.
+                    let Some(h) = h else { return };
+                    tracing::info!("opening playlist {id}");
+                    match h.playlist_tracks(&id).await {
+                        Ok(t) => {
+                            tracing::info!("playlist {id} → {} tracks", t.len());
+                            cache::list_put(&id, &t);
+                            if let Some(api) = api(&Some(h), &st, &rp).await {
+                                finish_tracks(&st, &rp, t, &api).await;
+                            }
+                        }
+                        Err(e) => fail(&st, &rp, format!("playlist: {e}")),
+                    }
+                });
             }
 
             Cmd::Play(uri) => {
@@ -377,23 +428,84 @@ async fn api(
     }
 }
 
-/// Store the results, then pull their cover art in the background so rows can show thumbnails.
-async fn finish_tracks(state: &Shared, repaint: &(impl Fn() + Send), tracks: Vec<Track>, api: &Client) {
-    let urls: Vec<String> = tracks.iter().filter_map(|t| t.art_url.clone()).collect();
+/// Paint a list of tracks with no network work at all (used for cache hits).
+fn show(state: &Shared, repaint: &(impl Fn() + Send), tracks: Vec<Track>) {
     set(state, repaint, |s| {
         s.busy = false;
         s.status = format!("{} tracks", tracks.len());
         s.tracks = tracks;
     });
-    for url in urls {
-        if state.lock().unwrap().art.contains_key(&url) {
-            continue;
-        }
-        if let Ok(bytes) = api.fetch_art(&url).await {
-            state.lock().unwrap().art.insert(url, bytes);
-            repaint();
+}
+
+/// Show the results immediately, then pull cover art in the background.
+///
+/// Two things this must NOT do, both of which it used to. It must not fetch art serially — a
+/// 350-track playlist is 350 round trips, and the list sat empty for all of them. And it must not
+/// fetch art *on the command loop* — that blocked every other command (opening another playlist,
+/// pressing play) behind hundreds of image downloads. So: hand the tracks to the UI, then spawn the
+/// art fetch and return.
+async fn finish_tracks(
+    state: &Shared,
+    repaint: &(impl Fn() + Send + Sync + Clone + 'static),
+    tracks: Vec<Track>,
+    api: &Client,
+) {
+    let mut urls: Vec<String> = {
+        let seen = state.lock().unwrap();
+        let mut urls: Vec<String> = tracks
+            .iter()
+            .filter_map(|t| t.art_url.clone())
+            .filter(|u| !seen.art.contains_key(u))
+            .collect();
+        urls.sort();
+        urls.dedup();
+        urls
+    };
+
+    // Serve what's already on disk without touching the network.
+    {
+        let mut hits = Vec::new();
+        urls.retain(|u| match cache::art_get(u) {
+            Some(bytes) => {
+                hits.push((u.clone(), bytes));
+                false
+            }
+            None => true,
+        });
+        if !hits.is_empty() {
+            let mut s = state.lock().unwrap();
+            for (u, b) in hits {
+                s.art.insert(u, b);
+            }
         }
     }
+
+    set(state, repaint, |s| {
+        s.busy = false;
+        s.status = format!("{} tracks", tracks.len());
+        s.tracks = tracks;
+    });
+
+    let state = state.clone();
+    let repaint = repaint.clone();
+    let token = api.token().to_string();
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        let art = Arc::new(Client::new(token));
+        let mut stream = futures_util::stream::iter(urls)
+            .map(|url| {
+                let art = art.clone();
+                async move { art.fetch_art(&url).await.ok().map(|b| (url, b)) }
+            })
+            .buffer_unordered(12);
+        while let Some(got) = stream.next().await {
+            if let Some((url, bytes)) = got {
+                cache::art_put(&url, &bytes);
+                state.lock().unwrap().art.insert(url, bytes);
+                repaint();
+            }
+        }
+    });
 }
 
 fn librespot_uri(uri: &str) -> Result<librespot_core::SpotifyUri, String> {

@@ -11,3 +11,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "nat
 serde = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 tracing.workspace = true
+futures-util = "0.3"

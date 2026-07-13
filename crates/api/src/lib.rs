@@ -6,7 +6,8 @@
 //!
 //! Everything here returns plain owned structs — the UI never sees `serde` or `reqwest` types.
 
-use serde::Deserialize;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 
 const API: &str = "https://api.spotify.com/v1";
 
@@ -19,7 +20,8 @@ pub enum ApiError {
 }
 
 /// A track as the UI wants it: already flattened, artists already joined.
-#[derive(Debug, Clone)]
+/// Serializable so the library can be cached to disk and shown instantly on next launch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub uri: String,
     pub name: String,
@@ -30,7 +32,7 @@ pub struct Track {
     pub art_url: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: String,
     pub name: String,
@@ -45,6 +47,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     pub fn new(token: String) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -77,29 +83,51 @@ impl Client {
         Ok(r.tracks.items.into_iter().map(Into::into).collect())
     }
 
-    /// Walk every page of a paged endpoint. `max` is a sanity stop, not a feature — Spotify's
-    /// `limit` maxes out at 50, so a single request is never the whole library.
-    async fn get_all<T: for<'de> Deserialize<'de>>(
+    /// Fetch every page of an offset-paged endpoint **concurrently**.
+    ///
+    /// Spotify caps `limit` at 50, so a 2000-track library is 40 requests. Walked serially (which
+    /// is what `next`-chasing forces) that's 40 round trips end-to-end and the UI sits empty for
+    /// all of them. The first response carries `total`, so every remaining offset can be issued at
+    /// once — the whole library then costs about as long as its slowest single request.
+    async fn get_paged<T: for<'de> Deserialize<'de>>(
         &self,
-        first: String,
+        base: &str,
         max: usize,
     ) -> Result<Vec<T>, ApiError> {
-        let mut url = Some(first);
-        let mut out = Vec::new();
-        while let Some(u) = url {
-            let page: Page<T> = self.get(&u).await?;
-            out.extend(page.items);
-            if out.len() >= max {
-                break;
-            }
-            url = page.next;
+        const LIMIT: u32 = 50;
+        let sep = if base.contains('?') { '&' } else { '?' };
+
+        let first: Page<T> = self.get(&format!("{base}{sep}limit={LIMIT}&offset=0")).await?;
+        let total = first.total.unwrap_or(first.items.len() as u32) as usize;
+        let want = total.min(max);
+        let mut out = first.items;
+        if out.len() >= want {
+            out.truncate(want);
+            return Ok(out);
         }
+
+        let offsets: Vec<u32> = (out.len()..want).step_by(LIMIT as usize).map(|o| o as u32).collect();
+        let pages: Vec<Result<Vec<T>, ApiError>> = futures_util::stream::iter(offsets)
+            .map(|off| async move {
+                let p: Page<T> = self
+                    .get(&format!("{base}{sep}limit={LIMIT}&offset={off}"))
+                    .await?;
+                Ok(p.items)
+            })
+            .buffered(8)
+            .collect()
+            .await;
+
+        for page in pages {
+            out.extend(page?);
+        }
+        out.truncate(want);
         Ok(out)
     }
 
-    /// Every saved ("Liked Songs") track, following pagination.
+    /// Every saved ("Liked Songs") track.
     pub async fn saved_tracks(&self, max: usize) -> Result<Vec<Track>, ApiError> {
-        let items: Vec<SavedTrack> = self.get_all(format!("{API}/me/tracks?limit=50"), max).await?;
+        let items: Vec<SavedTrack> = self.get_paged(&format!("{API}/me/tracks"), max).await?;
         Ok(items.into_iter().filter_map(|s| s.track).map(Into::into).collect())
     }
 
@@ -109,7 +137,7 @@ impl Client {
     /// playlists, ones with no `tracks` block). One bad entry must not lose the whole library.
     pub async fn playlists(&self, max: usize) -> Result<Vec<Playlist>, ApiError> {
         let items: Vec<Option<RawPlaylist>> = self
-            .get_all(format!("{API}/me/playlists?limit=50"), max)
+            .get_paged(&format!("{API}/me/playlists"), max)
             .await?;
         Ok(items
             .into_iter()
@@ -120,15 +148,6 @@ impl Client {
                 tracks: p.tracks.map(|t| t.total),
             })
             .collect())
-    }
-
-    /// Every track in a playlist, following pagination.
-    pub async fn playlist_tracks(&self, id: &str, max: usize) -> Result<Vec<Track>, ApiError> {
-        let items: Vec<PlaylistItem> = self
-            .get_all(format!("{API}/playlists/{id}/tracks?limit=50"), max)
-            .await?;
-        // Local files and removed tracks come back as null — skip rather than blow up the page.
-        Ok(items.into_iter().filter_map(|i| i.track).map(Into::into).collect())
     }
 
     /// Raw image bytes for a cover URL (art lives on a CDN, not the API host).
@@ -167,15 +186,13 @@ struct Page<T> {
     /// anything that ignores this silently truncates a real library.
     #[serde(default)]
     next: Option<String>,
+    /// Total across all pages — lets us fire every page at once instead of walking them serially.
+    #[serde(default)]
+    total: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct SavedTrack {
-    track: Option<RawTrack>,
-}
-
-#[derive(Deserialize)]
-struct PlaylistItem {
     track: Option<RawTrack>,
 }
 

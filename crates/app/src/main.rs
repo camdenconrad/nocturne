@@ -1,4 +1,5 @@
 mod backend;
+mod cache;
 
 use backend::{Cmd, NowPlaying, Shared};
 use eframe::egui;
