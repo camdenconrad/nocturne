@@ -13,6 +13,13 @@ use icons::Icon;
 use nocturne_api::fmt_duration;
 use std::collections::HashMap;
 
+thread_local! {
+    /// `add_controls` is called deep inside scrolling lists with only `&App`. It drops the request
+    /// here; `App::add_dialog` picks it up at top level next frame and opens a real window.
+    static ADD_REQUEST: std::cell::RefCell<Option<nocturne_api::Track>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 const SIDEBAR_W: f32 = 228.0;
 const NOWPANE_W: f32 = 320.0;
 const ROW_H: f32 = 56.0;
@@ -81,6 +88,8 @@ struct App {
     vibe: bool,
     /// Blurred backdrop textures, keyed by art url — built once, reused.
     blurred: HashMap<String, egui::TextureHandle>,
+    /// The track whose "add to playlist" dialog is open, if any.
+    add_to: Option<nocturne_api::Track>,
 }
 
 impl App {
@@ -101,11 +110,67 @@ impl App {
             // Full screen IS the app. Browsing is a detour you take and come back from.
             vibe: true,
             blurred: HashMap::new(),
+            add_to: None,
         }
     }
 
     fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(cmd);
+    }
+
+    /// Queue the "add to playlist" dialog. Uses interior state rather than opening a popup at the
+    /// call site, because the call sites live inside scrolling lists.
+    fn request_add_to(&self, track: nocturne_api::Track) {
+        // `add_controls` only has &self, so stash it through the command channel's sibling: a cell.
+        ADD_REQUEST.with(|c| *c.borrow_mut() = Some(track));
+    }
+
+    /// Draw the add-to-playlist dialog, if one was requested. Called once per frame, at top level,
+    /// so it is never clipped by a parent layout.
+    fn add_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(t) = ADD_REQUEST.with(|c| c.borrow_mut().take()) {
+            self.add_to = Some(t);
+        }
+        let Some(track) = self.add_to.clone() else {
+            return;
+        };
+        let playlists = self.state.lock().unwrap().playlists.clone();
+
+        let mut open = true;
+        egui::Window::new("Add to playlist")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&track.name).strong());
+                ui.label(RichText::new(&track.artists).weak().small());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Saved locally — Spotify blocks playlist writes for this app.")
+                        .weak()
+                        .small(),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for p in &playlists {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Button::new(&p.name).frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.send(Cmd::AddToPlaylist(p.id.clone(), track.clone()));
+                            self.add_to = None;
+                        }
+                    }
+                });
+            });
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.add_to = None;
+        }
     }
 
     /// Decode art bytes into a texture once; later frames hit the cache.
@@ -227,6 +292,7 @@ impl eframe::App for App {
                 self.sidebar(ctx);
             }
             self.vibe_view(ctx, now.clone());
+            self.add_dialog(ctx);
             if now.is_some_and(|n| !n.paused) {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
@@ -243,6 +309,8 @@ impl eframe::App for App {
             self.now_pane(ctx, now.clone());
         }
         self.track_list(ctx, &view, &status, busy, current.as_deref());
+
+        self.add_dialog(ctx);
 
         if now.is_some_and(|n| !n.paused) {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -301,7 +369,7 @@ impl App {
 
                 // Clicking the ACTIVE item still navigates: from the vibe screen, "Liked Songs"
                 // being highlighted must not mean it's un-clickable — that's how you get back to it.
-                if nav_item(ui, "♥   Liked Songs", view == "Liked Songs") {
+                if nav_item(ui, "Liked Songs", view == "Liked Songs", Some(Icon::HeartFilled)) {
                     self.send(Cmd::LoadSaved);
                     self.vibe = false;
                     self.show_sidebar = false;
@@ -379,10 +447,12 @@ impl App {
                         if hit.hovered() {
                             ui.painter()
                                 .rect_filled(r, Rounding::same(10.0), Color32::from_black_alpha(70));
-                            ui.put(
-                                r,
-                                egui::Label::new(RichText::new("⛶  Full screen").size(15.0))
-                                    .selectable(false),
+                            let ir = egui::Rect::from_center_size(r.center(), Vec2::splat(34.0));
+                            icons::paint(
+                                &ui.painter().clone(),
+                                ir,
+                                Icon::Fullscreen,
+                                theme::TEXT,
                             );
                         }
                         if hit.clicked() {
@@ -532,18 +602,21 @@ impl App {
                             .margin(Margin::symmetric(10.0, 7.0)),
                     );
                     let go = m.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (go || ui.button("▶ Radio").clicked()) && !self.mood.trim().is_empty() {
+                    if (go || labeled_button(ui, Icon::Radio, "Radio")) && !self.mood.trim().is_empty() {
                         self.send(Cmd::MoodRadio(self.mood.clone()));
                     }
                     ui.add_space(4.0);
-                    for (label, phrase) in [
-                        ("🍂 cozy lofi", "chill autumn lofi cozy"),
-                        ("⚡ hype", "hype energetic workout"),
-                        ("🌧 sad", "sad melancholy acoustic"),
-                        ("🌙 late night", "dark moody night chill"),
-                        ("💃 party", "happy dance party"),
+                    // Each mood gets an accent dot in a colour that means something: warm amber for
+                    // cozy, hot orange for hype, cold blue for sad, indigo for late night, magenta
+                    // for party. No emoji — a coloured dot reads at any size and is ours.
+                    for (label, phrase, accent) in [
+                        ("Cozy lofi", "chill autumn lofi cozy", Color32::from_rgb(214, 138, 62)),
+                        ("Hype", "hype energetic workout", Color32::from_rgb(233, 90, 44)),
+                        ("Melancholy", "sad melancholy acoustic", Color32::from_rgb(88, 124, 176)),
+                        ("Late night", "dark moody night chill", Color32::from_rgb(122, 96, 176)),
+                        ("Party", "happy dance party", Color32::from_rgb(196, 78, 130)),
                     ] {
-                        if chip(ui, label) {
+                        if chip(ui, label, accent) {
                             self.mood = phrase.to_string();
                             self.send(Cmd::MoodRadio(phrase.to_string()));
                         }
@@ -557,7 +630,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(RichText::new(format!("{} tracks", tracks.len())).weak().small());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if !tracks.is_empty() && ui.button("▶ Play all").clicked() {
+                        if !tracks.is_empty() && labeled_button(ui, Icon::Play, "Play all") {
                             self.send(Cmd::PlayQueue(tracks.clone()));
                             self.vibe = true;
                         }
@@ -601,7 +674,16 @@ impl App {
                                 Layout::centered_and_justified(egui::Direction::TopDown),
                                 |ui| {
                                     if is_current {
-                                        ui.label(RichText::new("▶").small().color(theme::ORANGE));
+                                        let (mr, _) = ui.allocate_exact_size(
+                                            Vec2::splat(14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        icons::paint(
+                                            &ui.painter().clone(),
+                                            mr,
+                                            Icon::Play,
+                                            theme::ORANGE,
+                                        );
                                     } else {
                                         ui.label(RichText::new(format!("{}", i + 1)).weak().small());
                                     }
@@ -688,10 +770,8 @@ impl App {
                             Rounding::same(6.0),
                             Color32::from_black_alpha(90),
                         );
-                        ui.put(
-                            art_rect,
-                            egui::Label::new(RichText::new("⛶").size(18.0)).selectable(false),
-                        );
+                        let ir = egui::Rect::from_center_size(art_rect.center(), Vec2::splat(22.0));
+                        icons::paint(&ui.painter().clone(), ir, Icon::Fullscreen, theme::TEXT);
                     }
                     if hit.clicked() {
                         self.vibe = true;
@@ -1105,37 +1185,19 @@ fn add_controls(
         })
         .clicked()
     {
-        app.send(Cmd::ToggleLike(track.uri.clone()));
+        app.send(Cmd::ToggleLike(track.clone()));
     }
 
-    // A menu button needs a widget; draw our own plus and open the menu on it.
-    let plus = icons::button_colored(ui, Icon::Plus, size + 8.0, Color32::from_gray(150));
-    let popup = egui::Id::new(("addto", &track.uri));
-    if plus.clicked() {
-        ui.memory_mut(|m| m.toggle_popup(popup));
+    // A real dialog, opened from anywhere. The previous version put an egui popup INSIDE the
+    // track-list ScrollArea, keyed per row — it got laid out, clipped and re-anchored every frame
+    // while the list scrolled, which is why it flickered and fought the mouse.
+    if icons::button_colored(ui, Icon::Plus, size + 8.0, Color32::from_gray(150))
+        .on_hover_text("Add to a playlist (local — Spotify blocks writes for this app)")
+        .clicked()
+    {
+        app.request_add_to(track.clone());
     }
-    egui::popup_below_widget(
-        ui,
-        popup,
-        &plus,
-        egui::PopupCloseBehavior::CloseOnClick,
-        |ui| {
-            ui.set_min_width(200.0);
-            ui.label(RichText::new("Add to playlist").weak().small());
-            ui.separator();
-            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                for p in playlists {
-                    if ui
-                        .add(egui::Button::new(&p.name).frame(false))
-                        .clicked()
-                    {
-                        app.send(Cmd::AddToPlaylist(p.id.clone(), track.clone()));
-                    }
-                }
-            });
-        },
-    );
-    plus.on_hover_text("Add to a playlist (local — Spotify blocks writes for this app)");
+    let _ = playlists;
 }
 
 /// A modern pill toggle — the kind every current app uses, instead of egui's default checkbox.
@@ -1190,45 +1252,112 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, hover: &str) -> egui::Response {
         .on_hover_text(hover)
 }
 
-/// A rounded, glossy pill button — the mood presets.
-fn chip(ui: &mut egui::Ui, label: &str) -> bool {
+/// A button with a real icon and a label — no glyph fonts.
+fn labeled_button(ui: &mut egui::Ui, icon: Icon, label: &str) -> bool {
     let galley = ui.painter().layout_no_wrap(
         label.to_string(),
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(13.0),
         theme::TEXT,
     );
-    let size = Vec2::new(galley.size().x + 20.0, 26.0);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let h = 30.0;
+    let w = 12.0 + 14.0 + 7.0 + galley.size().x + 12.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::click());
+    let v = ui.style().interact(&resp);
+    ui.painter()
+        .rect(rect, Rounding::same(8.0), v.weak_bg_fill, v.bg_stroke);
 
-    let bg = if resp.hovered() {
-        Color32::from_rgb(52, 44, 38)
-    } else {
-        Color32::from_rgb(34, 31, 38)
-    };
-    ui.painter().rect_filled(rect, Rounding::same(13.0), bg);
-    // The gloss: a lighter top half, which is what makes a flat rect read as a physical pill.
-    let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.center().y));
-    ui.painter().rect_filled(
-        top,
-        Rounding {
-            nw: 13.0,
-            ne: 13.0,
-            sw: 0.0,
-            se: 0.0,
-        },
-        Color32::from_white_alpha(6),
+    let ir = egui::Rect::from_center_size(
+        egui::pos2(rect.min.x + 12.0 + 7.0, rect.center().y),
+        Vec2::splat(14.0),
     );
-    ui.painter().rect_stroke(
-        rect,
-        Rounding::same(13.0),
-        Stroke::new(1.0, Color32::from_rgb(70, 58, 48)),
+    icons::paint(&ui.painter().clone(), ir, icon, v.fg_stroke.color);
+    ui.painter().galley(
+        egui::pos2(ir.max.x + 7.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        v.fg_stroke.color,
     );
-    ui.put(rect, egui::Label::new(RichText::new(label).size(12.0)).selectable(false));
     resp.clicked()
 }
 
-/// A sidebar row that highlights when it's the active view.
-fn nav_item(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+/// A mood pill.
+///
+/// Not a button with an emoji glued to it: a proper capsule with an accent dot, a hairline border
+/// that warms on hover, and a subtle top-lit gradient so it reads as a physical object rather than
+/// a coloured rectangle. Text is small, medium-weight and never emoji — glyph icons in a UI inherit
+/// the font's metrics and look like clip art.
+fn chip(ui: &mut egui::Ui, label: &str, accent: Color32) -> bool {
+    const H: f32 = 30.0;
+    const DOT: f32 = 7.0;
+    const PAD: f32 = 12.0;
+
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(12.5),
+        theme::TEXT,
+    );
+    let w = PAD + DOT + 8.0 + galley.size().x + PAD;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, H), egui::Sense::click());
+
+    let t = ui.ctx().animate_bool(resp.id, resp.hovered());
+    let rounding = Rounding::same(H / 2.0);
+
+    // Body: charcoal, lifting toward the accent on hover.
+    let base = Color32::from_rgb(30, 27, 34);
+    let hot = Color32::from_rgb(
+        (30.0 + (accent.r() as f32 - 30.0) * 0.22) as u8,
+        (27.0 + (accent.g() as f32 - 27.0) * 0.22) as u8,
+        (34.0 + (accent.b() as f32 - 34.0) * 0.22) as u8,
+    );
+    let body = Color32::from_rgb(
+        egui::lerp(base.r() as f32..=hot.r() as f32, t) as u8,
+        egui::lerp(base.g() as f32..=hot.g() as f32, t) as u8,
+        egui::lerp(base.b() as f32..=hot.b() as f32, t) as u8,
+    );
+    ui.painter().rect_filled(rect, rounding, body);
+
+    // A whisper of light along the top edge — the thing that separates "capsule" from "rectangle".
+    let sheen = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.max.x, rect.min.y + H * 0.5),
+    );
+    ui.painter().rect_filled(
+        sheen,
+        Rounding { nw: H / 2.0, ne: H / 2.0, sw: 0.0, se: 0.0 },
+        Color32::from_white_alpha(if resp.hovered() { 10 } else { 5 }),
+    );
+
+    // Hairline border, warming to the accent on hover.
+    let border = Color32::from_rgba_unmultiplied(
+        accent.r(),
+        accent.g(),
+        accent.b(),
+        (40.0 + 150.0 * t) as u8,
+    );
+    ui.painter().rect_stroke(rect, rounding, Stroke::new(1.0, border));
+
+    // Accent dot, with a soft halo when hovered.
+    let dot_c = egui::pos2(rect.min.x + PAD + DOT / 2.0, rect.center().y);
+    if t > 0.0 {
+        ui.painter().circle_filled(
+            dot_c,
+            DOT / 2.0 + 3.0 * t,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (60.0 * t) as u8),
+        );
+    }
+    ui.painter().circle_filled(dot_c, DOT / 2.0, accent);
+
+    let text_pos = egui::pos2(
+        dot_c.x + DOT / 2.0 + 8.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    let text_col = if resp.hovered() { theme::TEXT } else { Color32::from_gray(190) };
+    ui.painter().galley(text_pos, galley, text_col);
+
+    resp.clicked()
+}
+
+/// A sidebar row that highlights when it's the active view, with an optional leading icon.
+fn nav_item(ui: &mut egui::Ui, label: &str, active: bool, icon: Option<Icon>) -> bool {
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), egui::Sense::click());
     if active {
@@ -1237,12 +1366,26 @@ fn nav_item(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
         ui.painter()
             .rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(30, 28, 34));
     }
-    let text = RichText::new(label).color(if active { theme::ORANGE } else { theme::TEXT });
-    ui.child_ui(
-        rect.shrink2(Vec2::new(10.0, 0.0)),
+    let color = if active { theme::ORANGE } else { theme::TEXT };
+
+    let mut x = rect.min.x + 10.0;
+    if let Some(icon) = icon {
+        let ir = egui::Rect::from_center_size(
+            egui::pos2(x + 8.0, rect.center().y),
+            Vec2::splat(16.0),
+        );
+        icons::paint(&ui.painter().clone(), ir, icon, color);
+        x += 24.0;
+    }
+    let mut sub = ui.child_ui(
+        egui::Rect::from_min_max(egui::pos2(x, rect.min.y), rect.max),
         Layout::left_to_right(Align::Center),
         None,
-    )
-    .add(egui::Label::new(text).truncate().selectable(false));
+    );
+    sub.add(
+        egui::Label::new(RichText::new(label).color(color))
+            .truncate()
+            .selectable(false),
+    );
     resp.clicked()
 }

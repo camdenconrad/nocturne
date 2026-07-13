@@ -38,13 +38,17 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
 
     match icon {
         Icon::Play => {
-            // Nudged right by a hair: a triangle's visual centre sits left of its bounding box.
-            let a = r * 0.62;
+            // Span the box symmetrically: half the width either side of centre. The triangle's
+            // *centroid* sits a third of the way from its base, so nudge right by w/6 to make the
+            // shape look centred rather than merely be centred.
+            let hw = r * 0.58;
+            let hh = r * 0.66;
+            let nudge = hw / 3.0;
             p.add(egui::Shape::convex_polygon(
                 vec![
-                    Pos2::new(c.x - a * 0.55 + r * 0.08, c.y - a),
-                    Pos2::new(c.x - a * 0.55 + r * 0.08, c.y + a),
-                    Pos2::new(c.x + a * 0.95 + r * 0.08, c.y),
+                    Pos2::new(c.x - hw + nudge, c.y - hh),
+                    Pos2::new(c.x - hw + nudge, c.y + hh),
+                    Pos2::new(c.x + hw + nudge, c.y),
                 ],
                 color,
                 Stroke::NONE,
@@ -64,41 +68,65 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Prev | Icon::Next => {
             let dir = if icon == Icon::Next { 1.0 } else { -1.0 };
-            let a = r * 0.52;
-            // Two triangles + a bar, like every transport control ever made.
-            // The apex must point IN the direction of travel: base on the trailing side, tip on
-            // the leading side. Getting this backwards drew ⏭ as a rewind.
-            for k in [0.0, 1.0] {
-                let ox = dir * (r * 0.12 + k * a * 0.85);
+            let hh = r * 0.58;
+
+            // The glyph is a bar + two triangles. Lay it out on an explicit span from -X..+X so the
+            // WHOLE composite is centred on the box — the previous version grew outward from the
+            // centre in one direction only, so every prev/next button sat visibly off-centre.
+            let x0 = -r * 0.78; // trailing edge (bar side)
+            let x1 = r * 0.78; // leading edge (tip of the outer triangle)
+            let tri_w = (x1 - x0 - w) / 2.0; // two triangles share the space after the bar
+
+            // Bar, at the trailing edge.
+            let bx = c.x + dir * (x0 + w / 2.0);
+            p.rect_filled(
+                Rect::from_center_size(Pos2::new(bx, c.y), Vec2::new(w, hh * 2.0)),
+                egui::Rounding::same(w * 0.5),
+                color,
+            );
+
+            // Triangles, apex pointing IN the direction of travel (getting this backwards drew
+            // next-track as a rewind).
+            for k in 0..2 {
+                let base = x0 + w + k as f32 * tri_w;
+                let tip = base + tri_w;
                 p.add(egui::Shape::convex_polygon(
                     vec![
-                        Pos2::new(c.x + ox - dir * a * 0.75, c.y - a),
-                        Pos2::new(c.x + ox - dir * a * 0.75, c.y + a),
-                        Pos2::new(c.x + ox + dir * a * 0.35, c.y),
+                        Pos2::new(c.x + dir * base, c.y - hh),
+                        Pos2::new(c.x + dir * base, c.y + hh),
+                        Pos2::new(c.x + dir * tip, c.y),
                     ],
                     color,
                     Stroke::NONE,
                 ));
             }
-            let bx = c.x + dir * (r * 0.82);
-            p.rect_filled(
-                Rect::from_center_size(Pos2::new(bx, c.y), Vec2::new(w, a * 2.0)),
-                egui::Rounding::same(w * 0.5),
-                color,
-            );
         }
         Icon::Heart | Icon::HeartFilled => {
             // Two lobes and a point. Built as a polygon so it fills cleanly.
-            let mut pts = Vec::new();
-            let steps = 40;
-            for i in 0..=steps {
-                let t = i as f32 / steps as f32 * std::f32::consts::TAU;
-                // Classic heart parametric, scaled into the box.
-                let x = 16.0 * t.sin().powi(3);
-                let y = 13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos()
-                    - (4.0 * t).cos();
-                pts.push(Pos2::new(c.x + x * r / 17.0, c.y - y * r / 17.0));
+            // The classic heart parametric is NOT centred on its own origin — it runs about
+            // -17..+12 in y — so centring the curve's origin in the box leaves the glyph sitting
+            // low. Compute the curve, then centre its actual bounding box.
+            let steps = 48;
+            let raw: Vec<(f32, f32)> = (0..=steps)
+                .map(|i| {
+                    let t = i as f32 / steps as f32 * std::f32::consts::TAU;
+                    let x = 16.0 * t.sin().powi(3);
+                    let y = 13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos()
+                        - (4.0 * t).cos();
+                    (x, y)
+                })
+                .collect();
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for (_, y) in &raw {
+                lo = lo.min(*y);
+                hi = hi.max(*y);
             }
+            let mid = (lo + hi) / 2.0;
+            let scale = r * 0.92 / 17.0;
+            let pts: Vec<Pos2> = raw
+                .iter()
+                .map(|(x, y)| Pos2::new(c.x + x * scale, c.y - (y - mid) * scale))
+                .collect();
             if icon == Icon::HeartFilled {
                 p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
             } else {
@@ -110,8 +138,9 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             p.line_segment([Pos2::new(c.x, c.y - r * 0.62), Pos2::new(c.x, c.y + r * 0.62)], stroke);
         }
         Icon::Volume | Icon::VolumeLow | Icon::VolumeMute => {
-            // Speaker body: a small rect plus a cone.
-            let bx = c.x - r * 0.62;
+            // Speaker + waves, centred as a whole: the speaker sits left of centre precisely so the
+            // waves to its right balance it.
+            let bx = c.x - r * 0.72;
             p.rect_filled(
                 Rect::from_min_max(
                     Pos2::new(bx, c.y - r * 0.22),

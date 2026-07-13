@@ -33,8 +33,9 @@ pub enum Cmd {
     MoodRadio(String),
     /// Replace the queue with this list and play it from the top.
     PlayQueue(Vec<Track>),
-    /// Add/remove a track from the local library.
-    ToggleLike(String),
+    /// Add/remove a track from the local library. Carries the whole Track, because a locally-liked
+    /// song has to be MERGED INTO the Liked Songs list — a bare URI can't be rendered.
+    ToggleLike(Track),
     /// Jump to a track already in the queue (clicking Up Next).
     JumpTo(usize),
     /// Restore the last listening session (queue, track, position) — paused.
@@ -176,12 +177,21 @@ async fn run(
         Taste::load(&cache::model_path()).unwrap_or_default(),
     ));
     let mut backfilling = false;
-    // Where a restored session left off — the first play seeks here.
+    // A restored session shows a track but has NOT loaded it into the player. The first play must
+    // load it (and seek), not just un-pause. Inferring this from `resume_at > 0` was the bug that
+    // made a resumed track silent whenever it was restored at 0:00 — pressing play un-paused a
+    // player with nothing in it.
     let mut resume_at: u32 = 0;
-    // Local likes (Spotify won't take writes — see State::liked).
+    let mut needs_load = false;
+    // Likes = Spotify's Liked Songs (seeded when the list loads) PLUS local additions, MINUS local
+    // removals. Two overlay sets, because Spotify won't take the write and we still have to
+    // represent "he un-liked a track that Spotify thinks he likes".
+    let mut local_added: Vec<Track> = cache::list_get("local-likes").unwrap_or_default();
+    let mut local_removed: std::collections::HashSet<String> =
+        cache::list_get::<Vec<String>>("local-unlikes").unwrap_or_default().into_iter().collect();
     {
-        let liked: Vec<String> = cache::list_get("local-likes").unwrap_or_default();
-        state.lock().unwrap().liked = liked.into_iter().collect();
+        let mut s = state.lock().unwrap();
+        s.liked = local_added.iter().map(|t| t.uri.clone()).collect();
     }
     // The current listening run, with how much of each track was actually heard. A skip is the
     // only negative signal we get without asking the user anything.
@@ -237,11 +247,29 @@ async fn run(
             Cmd::LoadSaved => {
                 let (h, st, rp) = (handle.clone(), state.clone(), repaint.clone());
                 let tx2 = self_tx.clone();
+                let removed = local_removed.clone();
+                let added = local_added.clone();
                 tokio::spawn(async move {
                     set(&st, &rp, |s| s.view = "Liked Songs".into());
                     // Paint from disk first; the network refresh lands behind the visible list.
-                    let cached: Option<Vec<Track>> = cache::list_get("liked");
+                    // Liked Songs = Spotify's list, minus local un-likes, plus local likes. Merge
+                    // is done here (not just in the heart state) so a track you like actually shows
+                    // up in your library.
+                    let merge = |mut list: Vec<Track>| -> Vec<Track> {
+                        list.retain(|t| !removed.contains(&t.uri));
+                        for t in &added {
+                            if !list.iter().any(|x| x.uri == t.uri) {
+                                list.insert(0, t.clone());
+                            }
+                        }
+                        list
+                    };
+
+                    let cached: Option<Vec<Track>> = cache::list_get::<Vec<Track>>("liked").map(merge);
                     let cached_liked = cached.is_some();
+                    if let Some(t) = &cached {
+                        seed_likes(&st, t, &removed);
+                    }
                     if let Some(t) = cached {
                         if std::env::var_os("NOCTURNE_PLAY_FIRST").is_some() {
                             if let Some(first) = t.first() {
@@ -260,6 +288,8 @@ async fn run(
                             }
                             Ok(t) => {
                                 cache::list_put("liked", &t);
+                                let t = merge(t);
+                                seed_likes(&st, &t, &removed);
                                 // Debug hook: play the first track automatically, so time-to-audio
                                 // can be measured without a human clicking.
                                 if std::env::var_os("NOCTURNE_PLAY_FIRST").is_some() {
@@ -355,6 +385,7 @@ async fn run(
 
             Cmd::Play(uri) => {
                 if let Some(h) = &handle {
+                    needs_load = false;
                     record(&state, &mut run, &taste, &repaint);
                     // Whatever list is on screen becomes the queue, starting at the clicked track.
                     queue = state.lock().unwrap().tracks.clone();
@@ -372,18 +403,21 @@ async fn run(
                 if let Some(h) = &handle {
                     // First play after a restore: the player has nothing loaded, so load the track
                     // and seek to where he stopped rather than restarting it.
-                    if resume_at > 0 && !queue.is_empty() {
+                    if needs_load && !queue.is_empty() {
                         let at = resume_at;
                         resume_at = 0;
+                        needs_load = false;
                         paused = false;
                         start(&state, &repaint, h, &queue, qpos);
-                        h.seek(at);
-                        set(&state, &repaint, |s| {
-                            if let Some(n) = &mut s.now {
-                                n.position_ms = at;
-                                n.since = Some(Instant::now());
-                            }
-                        });
+                        if at > 0 {
+                            h.seek(at);
+                            set(&state, &repaint, |s| {
+                                if let Some(n) = &mut s.now {
+                                    n.position_ms = at;
+                                    n.since = Some(Instant::now());
+                                }
+                            });
+                        }
                         continue;
                     }
                     paused = !paused;
@@ -403,6 +437,7 @@ async fn run(
 
             Cmd::Next => {
                 if let Some(h) = &handle {
+                    needs_load = false;
                     record(&state, &mut run, &taste, &repaint);
                     if qpos + 1 < queue.len() {
                         qpos += 1;
@@ -664,6 +699,7 @@ async fn run(
 
             Cmd::PlayQueue(tracks) => {
                 if let Some(h) = &handle {
+                    needs_load = false;
                     record(&state, &mut run, &taste, &repaint);
                     queue = tracks;
                     qpos = 0;
@@ -676,15 +712,38 @@ async fn run(
                 }
             }
 
-            Cmd::ToggleLike(uri) => {
-                let now: Vec<String> = {
+            Cmd::ToggleLike(track) => {
+                let uri = track.uri.clone();
+                let now_liked = {
                     let mut s = state.lock().unwrap();
-                    if !s.liked.remove(&uri) {
+                    if s.liked.remove(&uri) {
+                        false
+                    } else {
                         s.liked.insert(uri.clone());
+                        true
                     }
-                    s.liked.iter().cloned().collect()
                 };
-                cache::list_put("local-likes", &now);
+                if now_liked {
+                    if !local_added.iter().any(|t| t.uri == uri) {
+                        local_added.push(track.clone());
+                    }
+                    local_removed.remove(&uri);
+                } else {
+                    local_removed.insert(uri.clone());
+                    local_added.retain(|t| t.uri != uri);
+                }
+                cache::list_put("local-likes", &local_added);
+                cache::list_put(
+                    "local-unlikes",
+                    &local_removed.iter().cloned().collect::<Vec<_>>(),
+                );
+
+                // If Liked Songs is on screen, reflect it NOW — liking a track and not seeing it
+                // appear in your library is indistinguishable from the like not working.
+                let showing_liked = state.lock().unwrap().view == "Liked Songs";
+                if showing_liked {
+                    let _ = self_tx.send(Cmd::LoadSaved);
+                }
                 repaint();
             }
 
@@ -735,6 +794,7 @@ async fn run(
                     }
                 });
                 resume_at = sess.position_ms;
+                needs_load = true;
 
                 // Fetch the cover for the restored track. `start()` normally does this, but a
                 // resume deliberately doesn't start playback — so the art has to be pulled here or
@@ -797,6 +857,7 @@ async fn run(
 
             Cmd::JumpTo(i) => {
                 if let Some(h) = &handle {
+                    needs_load = false;
                     if i < queue.len() {
                         record(&state, &mut run, &taste, &repaint);
                         qpos = i;
@@ -1274,6 +1335,17 @@ async fn api(
         Err(e) => {
             fail(state, repaint, format!("token: {e}"));
             None
+        }
+    }
+}
+
+/// Every track in his Spotify Liked Songs is, by definition, liked — so the hearts must already be
+/// filled when the list loads. Local un-likes are honoured on top.
+fn seed_likes(state: &Shared, tracks: &[Track], removed: &std::collections::HashSet<String>) {
+    let mut s = state.lock().unwrap();
+    for t in tracks {
+        if !removed.contains(&t.uri) {
+            s.liked.insert(t.uri.clone());
         }
     }
 }

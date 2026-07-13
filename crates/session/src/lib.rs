@@ -291,6 +291,11 @@ impl NocturneHandle {
             make_sink,
         );
 
+        // Set the volume explicitly. librespot's SoftMixer does not guarantee a sane starting
+        // level, and a mixer sitting at zero produces a stream that exists, shows up in the mixer,
+        // reports "Playing" — and is silent. Which is exactly what it looked like.
+        mixer.set_volume(u16::MAX);
+
         Ok(Self {
             session,
             player,
