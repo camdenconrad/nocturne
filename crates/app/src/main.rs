@@ -1,5 +1,6 @@
 mod backend;
 mod cache;
+mod emoji;
 mod fonts;
 
 use backend::{Cmd, NowPlaying, Shared};
@@ -45,6 +46,7 @@ struct App {
     tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
     query: String,
     textures: HashMap<String, egui::TextureHandle>,
+    emoji: emoji::Emoji,
     loaded: bool,
     autologin_tried: bool,
     /// Local volume while dragging, so the slider doesn't fight the backend each frame.
@@ -58,6 +60,7 @@ impl App {
             tx,
             query: String::new(),
             textures: HashMap::new(),
+            emoji: emoji::Emoji::new(),
             loaded: false,
             autologin_tried: false,
             volume: 1.0,
@@ -170,6 +173,7 @@ impl App {
     }
 
     fn sidebar(&mut self, ctx: &egui::Context) {
+        let ctx = &ctx.clone();
         egui::SidePanel::left("nav")
             .resizable(false)
             .exact_width(SIDEBAR_W)
@@ -192,15 +196,40 @@ impl App {
                 ui.add_space(6.0);
 
                 let playlists = self.state.lock().unwrap().playlists.clone();
+                let mut clicked: Option<String> = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for p in playlists {
-                            if nav_item(ui, &p.name, view == p.name) {
-                                self.send(Cmd::OpenPlaylist(p.id.clone()));
+                            let active = view == p.name;
+                            let (rect, resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 30.0),
+                                egui::Sense::click(),
+                            );
+                            if active {
+                                ui.painter().rect_filled(rect, Rounding::same(5.0), theme::SEL_HL);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    Rounding::same(5.0),
+                                    Color32::from_rgb(30, 28, 34),
+                                );
+                            }
+                            let mut row = ui.child_ui(
+                                rect.shrink2(Vec2::new(9.0, 0.0)),
+                                Layout::left_to_right(Align::Center),
+                                None,
+                            );
+                            let col = if active { Some(theme::ORANGE) } else { None };
+                            self.emoji.label(&mut row, ctx, &p.name, 14.0, col, false);
+                            if resp.clicked() {
+                                clicked = Some(p.id.clone());
                             }
                         }
                     });
+                if let Some(id) = clicked {
+                    self.send(Cmd::OpenPlaylist(id));
+                }
             });
     }
 
@@ -221,7 +250,23 @@ impl App {
                         self.send(Cmd::Search(self.query.clone()));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if busy {
+                        // Radio: keep playing past the end of the queue with Spotify's station for
+                        // the last track. On by default; this is the switch.
+                        let (mut autoplay, radio_loading) = {
+                            let st = self.state.lock().unwrap();
+                            (st.autoplay, st.radio_loading)
+                        };
+                        if ui
+                            .checkbox(&mut autoplay, "Radio")
+                            .on_hover_text(
+                                "When the queue runs out, keep playing similar tracks (Spotify radio)",
+                            )
+                            .changed()
+                        {
+                            self.send(Cmd::SetAutoplay(autoplay));
+                        }
+                        ui.add_space(10.0);
+                        if busy || radio_loading {
                             ui.spinner();
                         }
                         ui.label(RichText::new(status).weak().small());
@@ -231,7 +276,7 @@ impl App {
                 ui.add_space(14.0);
                 let tracks = self.state.lock().unwrap().tracks.clone();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(view).size(24.0).strong());
+                    self.emoji.label(ui, ctx, view, 24.0, None, true);
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(format!("{} tracks", tracks.len()))
@@ -290,14 +335,11 @@ impl App {
                             self.art_or_placeholder(&mut row, ctx, t.art_url.as_ref(), ART);
                             row.add_space(12.0);
 
+                            let em = &mut self.emoji;
                             row.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 1.0;
-                                let title = RichText::new(&t.name).strong();
-                                ui.label(if is_current {
-                                    title.color(theme::ORANGE)
-                                } else {
-                                    title
-                                });
+                                let col = is_current.then_some(theme::ORANGE);
+                                em.label(ui, ctx, &t.name, 14.0, col, true);
                                 ui.label(RichText::new(&t.artists).weak().small());
                             });
 

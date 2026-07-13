@@ -24,6 +24,8 @@ pub enum Cmd {
     Prev,
     Seek(u32),
     Volume(f32),
+    /// Turn radio (autoplay past the end of the queue) on or off.
+    SetAutoplay(bool),
 }
 
 #[derive(Default, Clone)]
@@ -63,6 +65,10 @@ pub struct State {
     /// Title of whatever is on screen ("Liked Songs", a playlist name, a search).
     pub view: String,
     pub volume: f32,
+    /// When the queue runs dry, keep playing with Spotify's radio for the last track.
+    pub autoplay: bool,
+    /// Set while the radio is being fetched, so the UI can say so.
+    pub radio_loading: bool,
     /// Decoded art bytes keyed by URL; the UI turns these into textures once.
     pub art: std::collections::HashMap<String, Vec<u8>>,
 }
@@ -79,6 +85,8 @@ impl Default for State {
             current_uri: None,
             view: String::new(),
             volume: 1.0,
+            autoplay: true,
+            radio_loading: false,
             art: Default::default(),
         }
     }
@@ -285,15 +293,41 @@ async fn run(
                         qpos += 1;
                         paused = false;
                         start(&state, &repaint, h, &queue, qpos);
-                    } else {
-                        // End of the queue: stop cleanly rather than looping the last track.
-                        h.stop();
-                        set(&state, &repaint, |s| {
-                            if let Some(n) = &mut s.now {
-                                n.paused = true;
-                                n.since = None;
+                    } else if state.lock().unwrap().autoplay && !queue.is_empty() {
+                        // Queue is dry and radio is on: extend it from the track that just played,
+                        // feeding the recent history back so the station doesn't repeat itself.
+                        set(&state, &repaint, |s| s.radio_loading = true);
+                        let seed = queue[qpos].uri.clone();
+                        let prev: Vec<String> = queue
+                            .iter()
+                            .rev()
+                            .take(10)
+                            .map(|t| t.uri.clone())
+                            .collect();
+                        match radio(h, &seed, &prev).await {
+                            Ok(more) if !more.is_empty() => {
+                                tracing::info!("radio: queued {} more tracks", more.len());
+                                set(&state, &repaint, |s| {
+                                    s.radio_loading = false;
+                                    s.status = format!("radio: +{} tracks", more.len());
+                                });
+                                queue.extend(more);
+                                qpos += 1;
+                                paused = false;
+                                start(&state, &repaint, h, &queue, qpos);
                             }
-                        });
+                            Ok(_) => {
+                                set(&state, &repaint, |s| s.radio_loading = false);
+                                stop_playback(&state, &repaint, h);
+                            }
+                            Err(e) => {
+                                set(&state, &repaint, |s| s.radio_loading = false);
+                                fail(&state, &repaint, format!("radio: {e}"));
+                                stop_playback(&state, &repaint, h);
+                            }
+                        }
+                    } else {
+                        stop_playback(&state, &repaint, h);
                     }
                 }
             }
@@ -331,6 +365,10 @@ async fn run(
                 }
             }
 
+            Cmd::SetAutoplay(on) => {
+                set(&state, &repaint, |s| s.autoplay = on);
+            }
+
             Cmd::Seek(ms) => {
                 if let Some(h) = &handle {
                     h.seek(ms);
@@ -344,6 +382,30 @@ async fn run(
             }
         }
     }
+}
+
+/// Ask Spotify's radio for tracks that follow on from `seed`.
+async fn radio(
+    h: &Arc<NocturneHandle>,
+    seed: &str,
+    previous: &[String],
+) -> Result<Vec<Track>, String> {
+    let seed = librespot_uri(seed)?;
+    let prev: Vec<librespot_core::SpotifyUri> =
+        previous.iter().filter_map(|u| librespot_uri(u).ok()).collect();
+    h.radio_from(&seed, &prev, 30)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn stop_playback(state: &Shared, repaint: &(impl Fn() + Send), h: &Arc<NocturneHandle>) {
+    h.stop();
+    set(state, repaint, |s| {
+        if let Some(n) = &mut s.now {
+            n.paused = true;
+            n.since = None;
+        }
+    });
 }
 
 /// Load queue[i] and reflect it in the UI immediately (don't wait for the player event).

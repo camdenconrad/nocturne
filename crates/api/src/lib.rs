@@ -76,11 +76,43 @@ impl Client {
         Ok(resp.json().await?)
     }
 
-    pub async fn search_tracks(&self, query: &str, limit: u32) -> Result<Vec<Track>, ApiError> {
+    /// Spotify caps search `limit` at **10** for restricted apps like ours — not the 50 the docs
+    /// advertise, and anything over 10 is a bare `400 Invalid limit`. So ask for pages of 10 and
+    /// fetch them concurrently to still fill a screen.
+    pub async fn search_tracks(&self, query: &str, want: usize) -> Result<Vec<Track>, ApiError> {
+        const SEARCH_LIMIT: usize = 10;
         let q = urlencode(query);
-        let url = format!("{API}/search?q={q}&type=track&limit={limit}");
-        let r: SearchResp = self.get(&url).await?;
-        Ok(r.tracks.items.into_iter().map(Into::into).collect())
+        let pages = want.div_ceil(SEARCH_LIMIT);
+        let offsets: Vec<usize> = (0..pages).map(|p| p * SEARCH_LIMIT).collect();
+
+        let results: Vec<Result<Vec<Track>, ApiError>> = futures_util::stream::iter(offsets)
+            .map(|off| {
+                let q = q.clone();
+                async move {
+                    let url = format!(
+                        "{API}/search?q={q}&type=track&limit={SEARCH_LIMIT}&offset={off}"
+                    );
+                    let r: SearchResp = self.get(&url).await?;
+                    Ok(r.tracks.items.into_iter().map(Into::into).collect::<Vec<Track>>())
+                }
+            })
+            .buffered(4)
+            .collect()
+            .await;
+
+        let mut out = Vec::new();
+        for page in results {
+            match page {
+                Ok(t) => out.extend(t),
+                // A later page 404ing/erroring shouldn't throw away the hits we already have.
+                Err(e) => {
+                    tracing::warn!("search page failed: {e}");
+                    break;
+                }
+            }
+        }
+        out.truncate(want);
+        Ok(out)
     }
 
     /// Fetch every page of an offset-paged endpoint **concurrently**.

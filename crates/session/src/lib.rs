@@ -382,6 +382,53 @@ impl NocturneHandle {
         Ok(out)
     }
 
+    /// Radio: what Spotify would play next once a queue runs dry.
+    ///
+    /// Uses the internal radio-apollo station service, not the Web API's `/recommendations` —
+    /// which is one of the endpoints Spotify 403s for post-2024 apps, same as playlist tracks.
+    /// `previous` is fed back so the station doesn't re-suggest what just played.
+    pub async fn radio_from(
+        &self,
+        seed_uri: &SpotifyUri,
+        previous: &[SpotifyUri],
+        count: usize,
+    ) -> Result<Vec<nocturne_api::Track>, SessionError> {
+        let prev_ids: Vec<SpotifyId> = previous
+            .iter()
+            .filter_map(|u| match u {
+                SpotifyUri::Track { id } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        let bytes = self
+            .session
+            .spclient()
+            .get_apollo_station("tracks", &seed_uri.to_uri(), Some(count), prev_ids, true)
+            .await
+            .map_err(|e| SessionError::Connect(format!("radio: {e}")))?;
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| SessionError::Connect(format!("radio json: {e}")))?;
+
+        // The station returns bare track uris; hydrate them through the same batched metadata path
+        // the playlists use.
+        let uris: Vec<SpotifyUri> = json["tracks"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t["uri"].as_str())
+                    .filter_map(|u| SpotifyUri::from_uri(u).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if uris.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.tracks_batch(&uris[..uris.len().min(BATCH)]).await
+    }
+
     pub fn seek(&self, position_ms: u32) {
         self.player.seek(position_ms);
     }
