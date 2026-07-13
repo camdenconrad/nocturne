@@ -12,9 +12,29 @@ use librespot_playback::player::Player;
 
 const OAUTH_SCOPES: &[&str] = &["streaming"];
 
+/// The Spotify app's client id, from the environment or a `.env` beside the binary/repo.
+/// No secret is needed anywhere — librespot's OAuth is PKCE.
 fn client_id() -> Result<String, SessionError> {
-    std::env::var("NOCTURNE_CLIENT_ID")
-        .map_err(|_| SessionError::OAuth("set NOCTURNE_CLIENT_ID to your Spotify app client id".into()))
+    if let Ok(id) = std::env::var("NOCTURNE_CLIENT_ID") {
+        return Ok(id);
+    }
+    for dir in [".", env!("CARGO_MANIFEST_DIR"), concat!(env!("CARGO_MANIFEST_DIR"), "/../..")] {
+        if let Ok(text) = std::fs::read_to_string(format!("{dir}/.env")) {
+            if let Some(id) = text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("NOCTURNE_CLIENT_ID="))
+                .next()
+            {
+                return Ok(id.trim().trim_matches(['"', '\'']).to_string());
+            }
+        }
+    }
+    Err(SessionError::OAuth(
+        "no NOCTURNE_CLIENT_ID — put it in Nocturne/.env (see .env.example) or export it. \
+         Get one at https://developer.spotify.com/dashboard with redirect URI \
+         http://127.0.0.1:8898/login"
+            .into(),
+    ))
 }
 
 #[derive(Debug, thiserror::Error)]
