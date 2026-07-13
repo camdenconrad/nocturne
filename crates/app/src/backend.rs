@@ -39,6 +39,8 @@ pub enum Cmd {
     JumpTo(usize),
     /// Restore the last listening session (queue, track, position) — paused.
     Resume,
+    /// Add a track to a playlist. Local: Spotify 403s playlist writes for restricted apps too.
+    AddToPlaylist(String, Track),
 }
 
 #[derive(Default, Clone)]
@@ -285,8 +287,12 @@ async fn run(
                             // Train only once the list exists — firing this from startup raced the
                             // load and trained on an empty playlist set.
                             let _ = self_tx.send(Cmd::TrainTaste);
-                            // Debug hook: NOCTURNE_OPEN=<name substring> opens one on startup, so
-                            // the real in-app path can be exercised without a human clicking.
+                            // Debug hook: fire a mood radio at startup, so the real in-app path can
+                            // be exercised (and compared across runs) without a human clicking.
+                            if let Ok(mood) = std::env::var("NOCTURNE_MOOD") {
+                                let _ = self_tx.send(Cmd::MoodRadio(mood));
+                            }
+                            // NOCTURNE_OPEN=<name substring> opens a playlist on startup.
                             if let Ok(want) = std::env::var("NOCTURNE_OPEN") {
                                 if let Some(hit) = p
                                     .iter()
@@ -326,8 +332,17 @@ async fn run(
                     let Some(h) = h else { return };
                     tracing::info!("opening playlist {id}");
                     match h.playlist_tracks(&id).await {
-                        Ok(t) => {
+                        Ok(mut t) => {
                             tracing::info!("playlist {id} → {} tracks", t.len());
+                            // Locally-added tracks live alongside Spotify's, since Spotify won't
+                            // take the write.
+                            if let Some(extra) = cache::list_get::<Vec<Track>>(&format!("added-{id}")) {
+                                for x in extra {
+                                    if !t.iter().any(|y| y.uri == x.uri) {
+                                        t.push(x);
+                                    }
+                                }
+                            }
                             cache::list_put(&id, &t);
                             if let Some(api) = api(&Some(h), &st, &rp).await {
                                 finish_tracks(&st, &rp, t, &api).await;
@@ -507,59 +522,144 @@ async fn run(
             }
 
             Cmd::MoodRadio(phrase) => {
-                let (m, understood) = nocturne_taste::mood::parse(&phrase);
-                if !understood {
-                    fail(
-                        &state,
-                        &repaint,
-                        format!("don't know that mood — try words like chill, hype, sad, lofi, winter"),
+                let (h, st, rp, ta, tx2) = (
+                    handle.clone(),
+                    state.clone(),
+                    repaint.clone(),
+                    taste.clone(),
+                    self_tx.clone(),
+                );
+                tokio::spawn(async move {
+                    // Haiku reads arbitrary phrasing when a key is set; the word list is the
+                    // offline floor. Either way we end up with the same acoustic target.
+                    let (m, understood) = nocturne_taste::llm::mood_for(&phrase).await;
+                    if !understood {
+                        fail(
+                            &st,
+                            &rp,
+                            "don't know that mood — try words like chill, hype, sad, lofi, winter"
+                                .into(),
+                        );
+                        return;
+                    }
+                    let Some(h) = h else { return };
+                    let target = nocturne_taste::mood::acoustic_vec(&m.to_features());
+
+                    busy(&st, &rp, format!("building “{phrase}” radio…"));
+                    set(&st, &rp, |s| s.view = format!("Mood: {phrase}"));
+
+                    // His library — the seed pool, and the "already owns this" filter.
+                    let mut library: Vec<Track> = cache::list_get("liked").unwrap_or_default();
+                    let ids: Vec<String> =
+                        st.lock().unwrap().playlists.iter().map(|p| p.id.clone()).collect();
+                    for id in ids {
+                        if let Some(ts) = cache::list_get::<Vec<Track>>(&id) {
+                            library.extend(ts);
+                        }
+                    }
+                    let owned: std::collections::HashSet<String> =
+                        library.iter().map(|t| t.uri.clone()).collect();
+
+                    // What he's already played — a discovery radio shouldn't re-serve it.
+                    let history: Vec<(Track, f32)> =
+                        cache::list_get::<Vec<Vec<(Track, f32)>>>("history")
+                            .unwrap_or_default()
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                    let heard: std::collections::HashSet<String> =
+                        history.iter().map(|(t, _)| t.uri.clone()).collect();
+
+                    // 1. Seeds: library tracks matching the mood AND his taste. Sampled, not
+                    //    top-N, so the same phrase doesn't seed the identical station every time.
+                    let seed_pool = ta
+                        .lock()
+                        .unwrap()
+                        .nearest_mood_for_me(&library, &target, &history, 25);
+                    if seed_pool.is_empty() {
+                        fail(&st, &rp, "no analyzed tracks yet — still learning".into());
+                        return;
+                    }
+                    let seeds = sample(&seed_pool, 6);
+
+                    // 2. Candidates from OUTSIDE the library: Spotify's station for each seed.
+                    let mut candidates: Vec<Track> = Vec::new();
+                    for seed in &seeds {
+                        if let Ok(u) = librespot_uri(&seed.uri) {
+                            match h.radio_from(&u, &[], 40).await {
+                                Ok(more) => candidates.extend(more),
+                                Err(e) => tracing::warn!("station for {}: {e}", seed.name),
+                            }
+                        }
+                    }
+                    candidates.retain(|t| !owned.contains(&t.uri) && !heard.contains(&t.uri));
+                    candidates.sort_by(|a, b| a.uri.cmp(&b.uri));
+                    candidates.dedup_by(|a, b| a.uri == b.uri);
+                    tracing::info!(
+                        "mood “{phrase}”: {} NEW candidates from {} seeds",
+                        candidates.len(),
+                        seeds.len()
                     );
-                    continue;
-                }
-                let target = nocturne_taste::mood::acoustic_vec(&m.to_features());
 
-                // The pool is his own library — a mood radio should play HIS music, not strangers'.
-                let mut pool: Vec<Track> = cache::list_get("liked").unwrap_or_default();
-                let ids: Vec<String> = state
-                    .lock()
-                    .unwrap()
-                    .playlists
-                    .iter()
-                    .map(|p| p.id.clone())
-                    .collect();
-                for id in ids {
-                    if let Some(ts) = cache::list_get::<Vec<Track>>(&id) {
-                        pool.extend(ts);
+                    // 3. Analyze the new ones — we've never seen them, so we have no features.
+                    let need: Vec<String> = {
+                        let t = ta.lock().unwrap();
+                        candidates
+                            .iter()
+                            .map(|t| nocturne_taste::track_id(&t.uri).to_string())
+                            .filter(|id| !t.features().contains_key(id))
+                            .collect()
+                    };
+                    if !need.is_empty() {
+                        let got = h.audio_features_many(&need).await;
+                        tracing::info!("mood: analyzed {}/{} new tracks", got.len(), need.len());
+                        ta.lock().unwrap().add_features(got.into_iter().collect());
                     }
-                }
 
-                let picks = taste.lock().unwrap().nearest_mood(&pool, &target, 60);
-                if picks.is_empty() {
-                    fail(&state, &repaint, "no analyzed tracks yet — still learning".into());
-                    continue;
-                }
-                tracing::info!("mood “{phrase}” → {} tracks", picks.len());
-                set(&state, &repaint, |s| {
-                    s.view = format!("Mood: {phrase}");
-                    s.status = format!("{} tracks", picks.len());
-                    s.busy = false;
-                    s.tracks = picks.clone();
+                    // 4. Rank both pools by mood+taste, then SAMPLE from the top of each — a radio
+                    //    that returns the identical order every time isn't a radio.
+                    let (new_ranked, fam_ranked) = {
+                        let t = ta.lock().unwrap();
+                        (
+                            t.nearest_mood_for_me(&candidates, &target, &history, 90),
+                            t.nearest_mood_for_me(&library, &target, &history, 40),
+                        )
+                    };
+                    let new_picks = sample(&new_ranked, 45);
+                    let familiar = sample(&fam_ranked, 15);
+
+                    // 5. Mostly discovery, with a familiar anchor every fourth track.
+                    let mut queue_tracks: Vec<Track> = Vec::new();
+                    let mut fam = familiar.into_iter();
+                    for (i, t) in new_picks.into_iter().enumerate() {
+                        if i % 4 == 3 {
+                            if let Some(f) = fam.next() {
+                                queue_tracks.push(f);
+                            }
+                        }
+                        queue_tracks.push(t);
+                    }
+                    // If the station gave us nothing new (rate limit, dead seed), fall back to his
+                    // library rather than leaving him with silence.
+                    if queue_tracks.is_empty() {
+                        tracing::warn!("mood: no new tracks — falling back to library");
+                        queue_tracks = sample(&fam_ranked, 40);
+                    }
+                    if queue_tracks.is_empty() {
+                        fail(&st, &rp, "radio came back empty — try another mood".into());
+                        return;
+                    }
+
+                    let n = queue_tracks.len();
+                    let fresh = queue_tracks.iter().filter(|t| !owned.contains(&t.uri)).count();
+                    tracing::info!("mood “{phrase}” → {n} tracks ({fresh} new to him)");
+                    set(&st, &rp, |s| {
+                        s.busy = false;
+                        s.status = format!("{n} tracks · {fresh} new");
+                        s.tracks = queue_tracks.clone();
+                    });
+                    let _ = tx2.send(Cmd::PlayQueue(queue_tracks));
                 });
-
-                // Fetch art for the new list, then start playing it immediately.
-                if let Some(api) = api(&handle, &state, &repaint).await {
-                    finish_tracks(&state, &repaint, picks.clone(), &api).await;
-                }
-                if let Some(h) = &handle {
-                    queue = picks;
-                    qpos = 0;
-                    paused = false;
-                    if let Some(t) = queue.first() {
-                        taste.lock().unwrap().observe(t);
-                        run.push((t.clone(), 0.0));
-                    }
-                    start(&state, &repaint, h, &queue, qpos);
-                }
             }
 
             Cmd::PlayQueue(tracks) => {
@@ -635,6 +735,64 @@ async fn run(
                     }
                 });
                 resume_at = sess.position_ms;
+
+                // Fetch the cover for the restored track. `start()` normally does this, but a
+                // resume deliberately doesn't start playback — so the art has to be pulled here or
+                // the full-screen view opens on a grey square.
+                if let Some(h) = handle.clone() {
+                    let (st, rp) = (state.clone(), repaint.clone());
+                    let (uri, known) = (t.uri.clone(), t.art_big.clone());
+                    tokio::spawn(async move {
+                        let Some(big) = (match known {
+                            Some(b) => Some(b),
+                            None => h.big_cover(&uri).await,
+                        }) else {
+                            return;
+                        };
+                        let bytes = match cache::art_get(&big) {
+                            Some(b) => Some(b),
+                            None => match reqwest::get(&big).await {
+                                Ok(r) => r.bytes().await.ok().map(|b| {
+                                    let b = b.to_vec();
+                                    cache::art_put(&big, &b);
+                                    b
+                                }),
+                                Err(_) => None,
+                            },
+                        };
+                        if let Some(bytes) = bytes {
+                            let mut s = st.lock().unwrap();
+                            s.art.insert(big.clone(), bytes);
+                            if let Some(n) = &mut s.now {
+                                n.art_big = Some(big);
+                            }
+                            drop(s);
+                            rp();
+                        }
+                    });
+                }
+            }
+
+            Cmd::AddToPlaylist(id, track) => {
+                // Local, like likes: Spotify 403s POST /v1/playlists/{id}/tracks for our app just
+                // as it does library writes. Additions are merged in when the playlist is opened.
+                let key = format!("added-{id}");
+                let mut added: Vec<Track> = cache::list_get(&key).unwrap_or_default();
+                if !added.iter().any(|t| t.uri == track.uri) {
+                    added.push(track.clone());
+                    cache::list_put(&key, &added);
+                }
+                let name = state
+                    .lock()
+                    .unwrap()
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                set(&state, &repaint, |s| {
+                    s.status = format!("added “{}” to {name}", track.name);
+                });
             }
 
             Cmd::JumpTo(i) => {
@@ -866,6 +1024,64 @@ fn spawn_backfill(
         set(&state, &repaint, |s| s.analyzing = false);
         tracing::info!("taste: analysis backfill COMPLETE ({total} tracks)");
     });
+}
+
+/// Take `count` from a ranked list, randomly but rank-biased.
+///
+/// Strict top-N made every radio identical: same phrase, same station, forever. Pure shuffle throws
+/// the ranking away. This samples without replacement with weight `1/(rank+2)`, so the best tracks
+/// are still the most likely to appear and the order changes every time you press play.
+fn sample(ranked: &[Track], count: usize) -> Vec<Track> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    if ranked.len() <= count {
+        return ranked.to_vec();
+    }
+
+    // Seed from the clock: a radio started twice in the same second may repeat; anything longer
+    // apart won't. No RNG dependency for a handful of draws.
+    let mut seed = {
+        let mut h = DefaultHasher::new();
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .hash(&mut h);
+        h.finish()
+    };
+    let mut next = || {
+        // xorshift64 — deterministic, fast, good enough to shuffle a playlist.
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+
+    let mut pool: Vec<(f64, Track)> = ranked
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (1.0 / (i as f64 + 2.0), t.clone()))
+        .collect();
+
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let total: f64 = pool.iter().map(|(w, _)| w).sum();
+        if total <= 0.0 || pool.is_empty() {
+            break;
+        }
+        let mut pick = next() * total;
+        let mut idx = pool.len() - 1;
+        for (i, (w, _)) in pool.iter().enumerate() {
+            pick -= w;
+            if pick <= 0.0 {
+                idx = i;
+                break;
+            }
+        }
+        out.push(pool.remove(idx).1);
+    }
+    out
 }
 
 /// Ask Spotify's radio for tracks that follow on from `seed`.

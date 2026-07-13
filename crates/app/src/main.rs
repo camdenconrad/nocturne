@@ -2,12 +2,14 @@ mod backend;
 mod cache;
 mod emoji;
 mod fonts;
+mod icons;
 mod mpris;
 
 use backend::{Cmd, NowPlaying, Shared};
 use eframe::egui;
 use egui::{Align, Color32, Layout, Margin, RichText, Rounding, Stroke, Vec2};
 use livewall_uikit::{chrome, theme};
+use icons::Icon;
 use nocturne_api::fmt_duration;
 use std::collections::HashMap;
 
@@ -93,7 +95,8 @@ impl App {
             loaded: false,
             autologin_tried: false,
             volume: 1.0,
-            show_sidebar: true,
+            // Tucked away: full screen is home, and the library is something you pull out.
+            show_sidebar: false,
             show_nowpane: true,
             // Full screen IS the app. Browsing is a detour you take and come back from.
             vibe: true,
@@ -286,8 +289,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("LIBRARY").weak().small());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new(RichText::new("✕").size(13.0)).frame(false))
+                        if icons::button(ui, Icon::Close, 22.0, false)
                             .on_hover_text("Close (Esc)")
                             .clicked()
                         {
@@ -297,9 +299,10 @@ impl App {
                 });
                 ui.add_space(8.0);
 
+                // Clicking the ACTIVE item still navigates: from the vibe screen, "Liked Songs"
+                // being highlighted must not mean it's un-clickable — that's how you get back to it.
                 if nav_item(ui, "♥   Liked Songs", view == "Liked Songs") {
                     self.send(Cmd::LoadSaved);
-                    // Picking a list is what takes you out of full screen.
                     self.vibe = false;
                     self.show_sidebar = false;
                 }
@@ -339,6 +342,7 @@ impl App {
                             }
                         }
                     });
+                // Same for playlists: re-clicking the one you're already in reopens it.
                 if let Some(id) = clicked {
                     self.send(Cmd::OpenPlaylist(id));
                     self.vibe = false;
@@ -366,7 +370,10 @@ impl App {
                 match &now {
                     Some(n) => {
                         let at = ui.next_widget_position();
-                        self.art_at(ui, &ctx2, n.art_url.as_ref(), art_size, 10.0);
+                        // The BIG cover. This pane is ~290px wide; the 64px thumbnail rendered here
+                        // looked exactly as bad as it sounds.
+                        let big = n.art_big.clone().or_else(|| n.art_url.clone());
+                        self.art_at(ui, &ctx2, big.as_ref(), art_size, 10.0);
                         let r = egui::Rect::from_min_size(at, Vec2::splat(art_size));
                         let hit = ui.interact(r, egui::Id::new("pane-art"), egui::Sense::click());
                         if hit.hovered() {
@@ -462,12 +469,17 @@ impl App {
             .show(ctx, |ui| {
                 // --- top row: panel toggles, search, radio switch ---
                 ui.horizontal(|ui| {
-                    if icon_button(ui, "⛶", "Back to full screen (Esc)").clicked()
+                    if icons::button(ui, Icon::Fullscreen, 30.0, true)
+                        .on_hover_text("Back to full screen (Esc)")
+                        .clicked()
                         || ui.input(|i| i.key_pressed(egui::Key::Escape))
                     {
                         self.vibe = true;
                     }
-                    if icon_button(ui, "☰", "Library").clicked() {
+                    if icons::button(ui, Icon::Menu, 30.0, true)
+                        .on_hover_text("Library")
+                        .clicked()
+                    {
                         self.show_sidebar = !self.show_sidebar;
                     }
                     ui.add_space(4.0);
@@ -483,7 +495,10 @@ impl App {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, "▤", "Show/hide up-next").clicked() {
+                        if icons::button(ui, Icon::Radio, 30.0, true)
+                            .on_hover_text("Show/hide up-next")
+                            .clicked()
+                        {
                             self.show_nowpane = !self.show_nowpane;
                         }
                         ui.add_space(8.0);
@@ -492,13 +507,10 @@ impl App {
                             let s = self.state.lock().unwrap();
                             (s.autoplay, s.radio_loading, s.analyzing, s.taste_features)
                         };
-                        if ui
-                            .checkbox(&mut autoplay, "Radio")
-                            .on_hover_text(format!(
-                                "When the queue runs out, keep playing — picked from your \
-                                 listening, using {feats} analyzed tracks"
-                            ))
-                            .changed()
+                        if toggle(ui, &mut autoplay, "Radio").on_hover_text(format!(
+                            "When the queue runs out, keep playing — picked from your listening, \
+                             using {feats} analyzed tracks"
+                        )).clicked()
                         {
                             self.send(Cmd::SetAutoplay(autoplay));
                         }
@@ -554,9 +566,11 @@ impl App {
                 ui.add_space(8.0);
 
                 // --- rows ---
-                let liked = self.state.lock().unwrap().liked.clone();
+                let (liked, playlists) = {
+                    let s = self.state.lock().unwrap();
+                    (s.liked.clone(), s.playlists.clone())
+                };
                 let mut play = None;
-                let mut like = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -607,17 +621,8 @@ impl App {
                             row.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.label(RichText::new(fmt_duration(t.duration_ms)).weak().small());
                                 ui.add_space(10.0);
-                                // Add/remove from the library.
-                                let on = liked.contains(&t.uri);
-                                let heart = RichText::new(if on { "♥" } else { "♡" })
-                                    .color(if on { theme::ORANGE } else { theme::TEXT });
-                                if ui
-                                    .add(egui::Button::new(heart).frame(false))
-                                    .on_hover_text("Add to / remove from your library (local)")
-                                    .clicked()
-                                {
-                                    like = Some(t.uri.clone());
-                                }
+                                // Like + add-to-playlist, on every row.
+                                add_controls(ui, self, t, liked.contains(&t.uri), &playlists, 15.0);
                                 ui.add_space(10.0);
                                 if ui.available_width() > 200.0 {
                                     ui.add_sized(
@@ -638,9 +643,7 @@ impl App {
                     // Chose a track — back to the vibe.
                     self.vibe = true;
                 }
-                if let Some(uri) = like {
-                    self.send(Cmd::ToggleLike(uri));
-                }
+
             });
     }
 
@@ -704,6 +707,18 @@ impl App {
                             egui::Label::new(RichText::new(&n.artists).weak().small()).truncate(),
                         );
                     });
+                    let (liked, playlists, track) = {
+                        let s = self.state.lock().unwrap();
+                        (
+                            s.current_uri.as_ref().is_some_and(|u| s.liked.contains(u)),
+                            s.playlists.clone(),
+                            s.queue.get(s.qpos).cloned(),
+                        )
+                    };
+                    if let Some(track) = track {
+                        lui.add_space(6.0);
+                        add_controls(&mut lui, self, &track, liked, &playlists, 16.0);
+                    }
                 }
 
                 // -- right: volume. Icon and bar share one horizontal row, so they're centred on
@@ -722,63 +737,78 @@ impl App {
                 if vol.changed() {
                     self.send(Cmd::Volume(self.volume));
                 }
-                rui.add_space(6.0);
-                let icon = if self.volume < 0.01 {
-                    "🔇"
+                rui.add_space(4.0);
+                let vi = if self.volume < 0.01 {
+                    Icon::VolumeMute
                 } else if self.volume < 0.5 {
-                    "🔉"
+                    Icon::VolumeLow
                 } else {
-                    "🔊"
+                    Icon::Volume
                 };
-                self.emoji.label(&mut rui, &ctx2, icon, 15.0, None, false);
+                // Same row as the bar, so icon and rail share a centre line.
+                let (vr, _) = rui.allocate_exact_size(Vec2::splat(20.0), egui::Sense::hover());
+                icons::paint(&rui.painter().clone(), vr, vi, theme::TEXT);
 
                 // -- centre: transport + scrubber --
                 let Some(n) = n else { return };
-                let cw = 460.0f32.min(full.width() - 2.0 * SIDE - 20.0).max(220.0);
+                let cw = 480.0f32.min(full.width() - 2.0 * SIDE - 20.0).max(240.0);
                 let centre = egui::Rect::from_center_size(
                     egui::pos2(full.center().x, full.center().y),
                     Vec2::new(cw, full.height()),
                 );
-                let mut cui = ui.child_ui(centre, Layout::top_down(Align::Center), None);
-                cui.add_space(4.0);
+                let cui = ui.child_ui(centre, Layout::top_down(Align::Center), None);
 
-                cui.horizontal(|ui| {
-                    let w = ui.available_width();
-                    ui.add_space((w - 132.0).max(0.0) / 2.0);
-                    if ui.add(egui::Button::new(RichText::new("⏮").size(15.0))).clicked() {
-                        self.send(Cmd::Prev);
-                    }
-                    ui.add_space(6.0);
-                    let icon = if n.paused { "▶" } else { "⏸" };
-                    if ui
-                        .add_sized([40.0, 30.0], egui::Button::new(RichText::new(icon).size(17.0)))
-                        .clicked()
-                    {
-                        self.send(Cmd::PlayPause);
-                    }
-                    ui.add_space(6.0);
-                    if ui.add(egui::Button::new(RichText::new("⏭").size(15.0))).clicked() {
-                        self.send(Cmd::Next);
-                    }
-                });
+                // Same layout rules as the full-screen view: one button baseline, an explicitly
+                // sized slider (add_sized does NOT stretch a Slider — spacing.slider_width does),
+                // fixed-width times, and the right-hand one counting down.
+                let _ = cui;
+                const BH: f32 = 34.0;
+                let brow = egui::Rect::from_center_size(
+                    egui::pos2(centre.center().x, centre.min.y + 24.0),
+                    Vec2::new(150.0, BH),
+                );
+                let mut bui = ui.child_ui(brow, Layout::left_to_right(Align::Center), None);
+                bui.spacing_mut().item_spacing.x = 8.0;
+                if icons::button(&mut bui, Icon::Prev, BH, true).clicked() {
+                    self.send(Cmd::Prev);
+                }
+                let pp = if n.paused { Icon::Play } else { Icon::Pause };
+                if icons::button(&mut bui, pp, BH + 6.0, true).clicked() {
+                    self.send(Cmd::PlayPause);
+                }
+                if icons::button(&mut bui, Icon::Next, BH, true).clicked() {
+                    self.send(Cmd::Next);
+                }
 
-                cui.add_space(3.0);
                 let elapsed = n.elapsed_ms();
-                cui.horizontal(|ui| {
-                    ui.label(RichText::new(fmt_duration(elapsed)).weak().small());
-                    let mut pos = elapsed as f32 / n.duration_ms.max(1) as f32;
-                    let bar = ui.add_sized(
-                        [ui.available_width() - 42.0, 14.0],
-                        egui::Slider::new(&mut pos, 0.0..=1.0)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    // Seek on release only — seeking every frame mid-drag would thrash the player.
-                    if bar.drag_stopped() {
-                        self.send(Cmd::Seek((pos * n.duration_ms as f32) as u32));
-                    }
-                    ui.label(RichText::new(fmt_duration(n.duration_ms)).weak().small());
-                });
+                let remaining = n.duration_ms.saturating_sub(elapsed);
+                const TW: f32 = 44.0;
+                let srect = egui::Rect::from_center_size(
+                    egui::pos2(centre.center().x, centre.min.y + 60.0),
+                    Vec2::new(cw, 18.0),
+                );
+                let mut sui = ui.child_ui(srect, Layout::left_to_right(Align::Center), None);
+                sui.spacing_mut().item_spacing.x = 8.0;
+                sui.spacing_mut().slider_width = cw - 2.0 * (TW + 8.0);
+                sui.add_sized(
+                    [TW, 16.0],
+                    egui::Label::new(RichText::new(fmt_duration(elapsed)).weak().small()),
+                );
+                let mut pos = elapsed as f32 / n.duration_ms.max(1) as f32;
+                let bar = sui.add(
+                    egui::Slider::new(&mut pos, 0.0..=1.0)
+                        .show_value(false)
+                        .trailing_fill(true),
+                );
+                if bar.drag_stopped() {
+                    self.send(Cmd::Seek((pos * n.duration_ms as f32) as u32));
+                }
+                sui.add_sized(
+                    [TW, 16.0],
+                    egui::Label::new(
+                        RichText::new(format!("-{}", fmt_duration(remaining))).weak().small(),
+                    ),
+                );
             });
     }
 }
@@ -873,6 +903,32 @@ impl App {
                 tui.label(RichText::new(&n.name).size(26.0).strong().color(theme::TEXT));
                 tui.label(RichText::new(&n.artists).size(15.0).color(Color32::from_gray(170)));
 
+                // Like / add-to-playlist, right where the track is.
+                //
+                // Everything is read under ONE lock. `if let Some(x) = self.state.lock()...` keeps
+                // the temporary guard alive for the whole `if let` body, so locking again inside it
+                // deadlocks against itself — std::sync::Mutex is not reentrant. That froze the
+                // entire app (and MPRIS with it).
+                let (liked, playlists, track) = {
+                    let s = self.state.lock().unwrap();
+                    let uri = s.current_uri.clone();
+                    (
+                        uri.as_ref().is_some_and(|u| s.liked.contains(u)),
+                        s.playlists.clone(),
+                        s.queue.get(s.qpos).cloned(),
+                    )
+                };
+                {
+                    if let Some(track) = track {
+                        tui.add_space(8.0);
+                        tui.horizontal(|ui| {
+                            let w = ui.available_width();
+                            ui.add_space((w - 70.0).max(0.0) / 2.0);
+                            add_controls(ui, self, &track, liked, &playlists, 20.0);
+                        });
+                    }
+                }
+
                 // 4. Scrubber + transport, centred at the bottom.
                 let cw = 560.0f32.min(full.width() - 80.0);
                 let ctrl = egui::Rect::from_center_size(
@@ -928,30 +984,21 @@ impl App {
                 // All three buttons share ONE height, so ⏮ and ⏭ sit on the play button's centre
                 // line instead of riding high.
                 const BTN_H: f32 = 44.0;
-                let row_w = 44.0 + 56.0 + 44.0 + 20.0;
+                let row_w = 44.0 + 52.0 + 44.0 + 20.0;
                 let row = egui::Rect::from_center_size(
                     egui::pos2(ctrl.center().x, ctrl.min.y + 58.0),
                     Vec2::new(row_w, BTN_H),
                 );
                 let mut bui = ui.child_ui(row, Layout::left_to_right(Align::Center), None);
                 bui.spacing_mut().item_spacing.x = 10.0;
-                if bui
-                    .add_sized([44.0, BTN_H], egui::Button::new(RichText::new("⏮").size(16.0)))
-                    .clicked()
-                {
+                if icons::button(&mut bui, Icon::Prev, BTN_H, true).clicked() {
                     self.send(Cmd::Prev);
                 }
-                let icon = if n.paused { "▶" } else { "⏸" };
-                if bui
-                    .add_sized([56.0, BTN_H], egui::Button::new(RichText::new(icon).size(20.0)))
-                    .clicked()
-                {
+                let pp = if n.paused { Icon::Play } else { Icon::Pause };
+                if icons::button(&mut bui, pp, BTN_H + 8.0, true).clicked() {
                     self.send(Cmd::PlayPause);
                 }
-                if bui
-                    .add_sized([44.0, BTN_H], egui::Button::new(RichText::new("⏭").size(16.0)))
-                    .clicked()
-                {
+                if icons::button(&mut bui, Icon::Next, BTN_H, true).clicked() {
                     self.send(Cmd::Next);
                 }
 
@@ -961,8 +1008,8 @@ impl App {
                     egui::pos2(full.min.x + 8.0, full.min.y + 8.0),
                     Vec2::new(38.0, 34.0),
                 );
-                if ui
-                    .put(tab, egui::Button::new(RichText::new("☰").size(16.0)))
+                let mut tui2 = ui.child_ui(tab, Layout::left_to_right(Align::Center), None);
+                if icons::button(&mut tui2, Icon::Menu, 34.0, true)
                     .on_hover_text("Library (L)")
                     .clicked()
                     || ui.input(|i| i.key_pressed(egui::Key::L))
@@ -1031,6 +1078,110 @@ fn mini_row(
         );
     });
     resp.clicked()
+}
+
+/// Like + "add to playlist", the pair that belongs next to any track, anywhere.
+///
+/// Both are LOCAL: Spotify 403s every library and playlist write for a restricted app, so these
+/// live on disk and are merged into the display. The tooltip says so rather than pretending.
+fn add_controls(
+    ui: &mut egui::Ui,
+    app: &App,
+    track: &nocturne_api::Track,
+    liked: bool,
+    playlists: &[nocturne_api::Playlist],
+    size: f32,
+) {
+    let (icon, color) = if liked {
+        (Icon::HeartFilled, theme::ORANGE)
+    } else {
+        (Icon::Heart, Color32::from_gray(150))
+    };
+    if icons::button_colored(ui, icon, size + 8.0, color)
+        .on_hover_text(if liked {
+            "Remove from your library (local)"
+        } else {
+            "Add to your library (local)"
+        })
+        .clicked()
+    {
+        app.send(Cmd::ToggleLike(track.uri.clone()));
+    }
+
+    // A menu button needs a widget; draw our own plus and open the menu on it.
+    let plus = icons::button_colored(ui, Icon::Plus, size + 8.0, Color32::from_gray(150));
+    let popup = egui::Id::new(("addto", &track.uri));
+    if plus.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup));
+    }
+    egui::popup_below_widget(
+        ui,
+        popup,
+        &plus,
+        egui::PopupCloseBehavior::CloseOnClick,
+        |ui| {
+            ui.set_min_width(200.0);
+            ui.label(RichText::new("Add to playlist").weak().small());
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                for p in playlists {
+                    if ui
+                        .add(egui::Button::new(&p.name).frame(false))
+                        .clicked()
+                    {
+                        app.send(Cmd::AddToPlaylist(p.id.clone(), track.clone()));
+                    }
+                }
+            });
+        },
+    );
+    plus.on_hover_text("Add to a playlist (local — Spotify blocks writes for this app)");
+}
+
+/// A modern pill toggle — the kind every current app uses, instead of egui's default checkbox.
+fn toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(12.5),
+        theme::TEXT,
+    );
+    let track_w = 34.0f32;
+    let h = 20.0f32;
+    let size = Vec2::new(track_w + 8.0 + galley.size().x, h.max(22.0));
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+    }
+
+    let track = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x, rect.center().y - h / 2.0),
+        Vec2::new(track_w, h),
+    );
+    // Animate the knob so the state change reads as motion, not a jump.
+    let t = ui.ctx().animate_bool(resp.id, *on);
+    let bg = Color32::from_rgb(
+        (46.0 + t * (233.0 - 46.0)) as u8,
+        (42.0 + t * (110.0 - 42.0)) as u8,
+        (50.0 + t * (44.0 - 50.0)) as u8,
+    );
+    ui.painter().rect_filled(track, Rounding::same(h / 2.0), bg);
+    if !*on {
+        ui.painter().rect_stroke(
+            track,
+            Rounding::same(h / 2.0),
+            Stroke::new(1.0, Color32::from_rgb(70, 62, 58)),
+        );
+    }
+    let knob_x = egui::lerp((track.min.x + h / 2.0)..=(track.max.x - h / 2.0), t);
+    ui.painter().circle_filled(
+        egui::pos2(knob_x, track.center().y),
+        h / 2.0 - 3.0,
+        Color32::from_rgb(240, 238, 236),
+    );
+
+    let text_pos = egui::pos2(track.max.x + 8.0, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(text_pos, galley, theme::TEXT);
+    resp
 }
 
 /// A small square icon button (panel toggles).
