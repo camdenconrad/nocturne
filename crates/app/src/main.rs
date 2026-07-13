@@ -794,8 +794,10 @@ impl App {
         }
         let bytes = self.state.lock().unwrap().art.get(url).cloned()?;
         let img = image::load_from_memory(&bytes).ok()?;
-        let small = img.resize_exact(24, 24, image::imageops::FilterType::Triangle).to_rgba8();
-        let color = egui::ColorImage::from_rgba_unmultiplied([24, 24], small.as_raw());
+        // 12px, not 24: stretched across ~1300px that's a much softer blur, which is what stops
+        // the backdrop competing with the cover in front of it.
+        let small = img.resize_exact(12, 12, image::imageops::FilterType::Triangle).to_rgba8();
+        let color = egui::ColorImage::from_rgba_unmultiplied([12, 12], small.as_raw());
         let tex = ctx.load_texture(format!("blur-{url}"), color, egui::TextureOptions::LINEAR);
         self.blurred.insert(url.to_string(), tex.clone());
         Some(tex)
@@ -816,14 +818,18 @@ impl App {
                 {
                     if let Some(bg) = self.backdrop(&ctx2, &url) {
                         egui::Image::new(&bg).paint_at(ui, full);
-                        // Scrim, or nothing on top of it would be readable.
-                        ui.painter().rect_filled(full, Rounding::ZERO, Color32::from_black_alpha(150));
-                        // Vignette: darken the bottom so the controls sit on solid ground.
-                        let lower = egui::Rect::from_min_max(
-                            egui::pos2(full.min.x, full.center().y),
-                            full.max,
+                        // Flat scrim so anything on top stays readable…
+                        ui.painter()
+                            .rect_filled(full, Rounding::ZERO, Color32::from_black_alpha(130));
+                        // …then a SMOOTH top-to-bottom darkening. This used to be a rect covering
+                        // the bottom half, which drew a hard horizontal seam straight across the
+                        // middle of the window. A gradient has no edge to see.
+                        vertical_gradient(
+                            ui,
+                            full,
+                            Color32::from_black_alpha(0),
+                            Color32::from_black_alpha(165),
                         );
-                        ui.painter().rect_filled(lower, Rounding::ZERO, Color32::from_black_alpha(90));
                     }
                 }
 
@@ -868,60 +874,86 @@ impl App {
                 tui.label(RichText::new(&n.artists).size(15.0).color(Color32::from_gray(170)));
 
                 // 4. Scrubber + transport, centred at the bottom.
-                let cw = 520.0f32.min(full.width() - 80.0);
+                let cw = 560.0f32.min(full.width() - 80.0);
                 let ctrl = egui::Rect::from_center_size(
-                    egui::pos2(full.center().x, full.max.y - 62.0),
-                    Vec2::new(cw, 96.0),
+                    egui::pos2(full.center().x, full.max.y - 56.0),
+                    Vec2::new(cw, 100.0),
                 );
-                let mut cui = ui.child_ui(ctrl, Layout::top_down(Align::Center), None);
+                let cui = ui.child_ui(ctrl, Layout::top_down(Align::Center), None);
+                let _ = cui;
 
-                // Fixed-width time labels on both sides, so the bar sits dead centre instead of
-                // drifting with the length of the timestamps.
+                // Elapsed on the left counting UP, remaining on the right counting DOWN, with the
+                // bar exactly between them. Widths are fixed and the row is laid out in an explicit
+                // centred rect, so the bar cannot drift as the timestamps change width.
                 let elapsed = n.elapsed_ms();
-                cui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.add_sized(
-                        [44.0, 16.0],
-                        egui::Label::new(RichText::new(fmt_duration(elapsed)).weak().small()),
-                    );
-                    let mut pos = elapsed as f32 / n.duration_ms.max(1) as f32;
-                    let bar = ui.add_sized(
-                        [ui.available_width() - 52.0, 16.0],
-                        egui::Slider::new(&mut pos, 0.0..=1.0)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    if bar.drag_stopped() {
-                        self.send(Cmd::Seek((pos * n.duration_ms as f32) as u32));
-                    }
-                    ui.add_sized(
-                        [44.0, 16.0],
-                        egui::Label::new(
-                            RichText::new(fmt_duration(n.duration_ms)).weak().small(),
-                        ),
-                    );
-                });
+                let remaining = n.duration_ms.saturating_sub(elapsed);
+                const T_W: f32 = 46.0;
+                const GAP: f32 = 10.0;
+                let bar_w = cw - 2.0 * (T_W + GAP);
 
-                cui.add_space(10.0);
-                cui.horizontal(|ui| {
-                    let w = ui.available_width();
-                    ui.add_space((w - 170.0).max(0.0) / 2.0);
-                    if ui.add_sized([44.0, 36.0], egui::Button::new(RichText::new("⏮").size(17.0))).clicked() {
-                        self.send(Cmd::Prev);
-                    }
-                    ui.add_space(8.0);
-                    let icon = if n.paused { "▶" } else { "⏸" };
-                    if ui
-                        .add_sized([52.0, 40.0], egui::Button::new(RichText::new(icon).size(20.0)))
-                        .clicked()
-                    {
-                        self.send(Cmd::PlayPause);
-                    }
-                    ui.add_space(8.0);
-                    if ui.add_sized([44.0, 36.0], egui::Button::new(RichText::new("⏭").size(17.0))).clicked() {
-                        self.send(Cmd::Next);
-                    }
-                });
+                // Rows are placed at EXPLICIT y offsets inside `ctrl`. Deriving both from
+                // `next_widget_position()` put them at the same y and the buttons landed on top of
+                // the scrubber.
+                let srect = egui::Rect::from_center_size(
+                    egui::pos2(ctrl.center().x, ctrl.min.y + 14.0),
+                    Vec2::new(cw, 20.0),
+                );
+                let mut sui = ui.child_ui(srect, Layout::left_to_right(Align::Center), None);
+                sui.spacing_mut().item_spacing.x = GAP;
+                // A Slider takes its width from spacing.slider_width — `add_sized` does NOT stretch
+                // it, which is why the bar came out stubby and off-centre.
+                sui.spacing_mut().slider_width = bar_w;
+
+                sui.add_sized(
+                    [T_W, 16.0],
+                    egui::Label::new(RichText::new(fmt_duration(elapsed)).weak().small()),
+                );
+                let mut pos = elapsed as f32 / n.duration_ms.max(1) as f32;
+                let bar = sui.add_sized(
+                    [bar_w, 16.0],
+                    egui::Slider::new(&mut pos, 0.0..=1.0)
+                        .show_value(false)
+                        .trailing_fill(true),
+                );
+                if bar.drag_stopped() {
+                    self.send(Cmd::Seek((pos * n.duration_ms as f32) as u32));
+                }
+                sui.add_sized(
+                    [T_W, 16.0],
+                    egui::Label::new(
+                        RichText::new(format!("-{}", fmt_duration(remaining))).weak().small(),
+                    ),
+                );
+
+                // All three buttons share ONE height, so ⏮ and ⏭ sit on the play button's centre
+                // line instead of riding high.
+                const BTN_H: f32 = 44.0;
+                let row_w = 44.0 + 56.0 + 44.0 + 20.0;
+                let row = egui::Rect::from_center_size(
+                    egui::pos2(ctrl.center().x, ctrl.min.y + 58.0),
+                    Vec2::new(row_w, BTN_H),
+                );
+                let mut bui = ui.child_ui(row, Layout::left_to_right(Align::Center), None);
+                bui.spacing_mut().item_spacing.x = 10.0;
+                if bui
+                    .add_sized([44.0, BTN_H], egui::Button::new(RichText::new("⏮").size(16.0)))
+                    .clicked()
+                {
+                    self.send(Cmd::Prev);
+                }
+                let icon = if n.paused { "▶" } else { "⏸" };
+                if bui
+                    .add_sized([56.0, BTN_H], egui::Button::new(RichText::new(icon).size(20.0)))
+                    .clicked()
+                {
+                    self.send(Cmd::PlayPause);
+                }
+                if bui
+                    .add_sized([44.0, BTN_H], egui::Button::new(RichText::new("⏭").size(16.0)))
+                    .clicked()
+                {
+                    self.send(Cmd::Next);
+                }
 
                 // 5. The library tab. This is the ONLY way out — pop it, pick something, and the
                 //    app drops you straight back here.
@@ -945,6 +977,20 @@ impl App {
                 }
             });
     }
+}
+
+/// Paint a smooth vertical gradient. egui has no gradient primitive, so this is a two-triangle
+/// mesh with per-vertex colours — the GPU interpolates, and there is no visible band or seam.
+fn vertical_gradient(ui: &egui::Ui, rect: egui::Rect, top: Color32, bottom: Color32) {
+    use egui::epaint::{Mesh, Vertex};
+    let mut mesh = Mesh::default();
+    let uv = egui::pos2(0.0, 0.0);
+    mesh.vertices.push(Vertex { pos: rect.left_top(), uv, color: top });
+    mesh.vertices.push(Vertex { pos: rect.right_top(), uv, color: top });
+    mesh.vertices.push(Vertex { pos: rect.right_bottom(), uv, color: bottom });
+    mesh.vertices.push(Vertex { pos: rect.left_bottom(), uv, color: bottom });
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    ui.painter().add(egui::Shape::mesh(mesh));
 }
 
 /// A compact row for the Up Next / Previously lists.
