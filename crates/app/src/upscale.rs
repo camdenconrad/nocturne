@@ -1,27 +1,37 @@
 //! Real-ESRGAN upscaling for the full-screen cover.
 //!
-//! Spotify's largest cover is 640×640. On a 4K panel the full-screen view stretches that to well
-//! over 1000px, and a bilinear stretch of a 640px JPEG is exactly as soft as it sounds.
+//! ## What we start from
 //!
-//! `realesrgan-ncnn-vulkan` runs the real model on the 4080 (Vulkan, not CPU), 4× → 2560×2560.
+//! Not the 640px cover the Web API advertises. Spotify's CDN will hand over the **original master**
+//! the label uploaded — usually 1800–2000px — if you rewrite the size prefix in the image id (see
+//! [`crate::cache::art_fetch_best`]). That art is already sharper than the full-screen view needs
+//! on a 4K panel, and it costs one HTTP GET.
 //!
-//! ## Cached, deliberately
+//! So the upscale is no longer rescuing a soft 640px JPEG. It runs on top of the master, purely for
+//! headroom: 2000 → **8000×8000** through `realesrgan-x4plus` on the 4080 (Vulkan, not CPU).
 //!
-//! Camden asked for "a real ESRGAN pass each time". It IS a real pass — but the result is *cached*,
-//! because the model is deterministic: the same cover upscaled twice produces byte-identical output.
-//! Re-running it on every play would burn ~1s of GPU per track to recompute a value we already have,
-//! and it would stutter the very view it's meant to make beautiful. First play of an album pays the
-//! pass; every play after is instant.
+//! ## Why 4×, and not the 8× this started as
 //!
-//! Everything here is best-effort: no binary, no GPU, a timeout, a crash — the UI just keeps the
-//! original cover. An upscale is never allowed to break playback.
+//! 8× of the master would be 16000², which is ~1GB of VRAM per cover and ~6GB across the resident
+//! window — for detail no display can show. 4× of the master (8000²) already beats the old
+//! 640→8×→5120 chain on both axes: bigger, and made of real detail rather than invented detail.
+//!
+//! ## RAM only, deliberately
+//!
+//! The 8000² result is a ~118MB PNG and 256MB decoded. Caching that on disk would cost tens of GB
+//! across a library, so nothing is persisted: the pass runs into RAM, and the resident window in
+//! [`crate::App`] *is* the cache. A cover that falls out of the window and comes back is recomputed
+//! — and while it recomputes, the view shows the master, which is sharp on its own.
+//!
+//! Everything here is best-effort: no binary, no GPU, a crash — the UI just keeps the master. An
+//! upscale is never allowed to break playback.
 
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Model choice matters. Album art is illustration as often as photography, and `x4plus-anime` is
-/// tuned for flat colour and line art — it keeps edges crisp where the photo model smears them.
-/// The general model handles photographic covers.
+/// Album art is illustration as often as photography, and the general model handles both without
+/// the plastic look `x4plus-anime` gives a photographic cover.
 const MODEL: &str = "realesrgan-x4plus";
 const MODELS_DIR: &str = "/usr/share/realesrgan-ncnn-vulkan/models";
 const BIN: &str = "realesrgan-ncnn-vulkan";
@@ -39,72 +49,75 @@ fn which(bin: &str) -> Option<PathBuf> {
     })
 }
 
-/// Where the upscaled cover lives. Keyed by the source id + model, so changing the model or the
-/// cover invalidates it for free.
-pub fn cached_path(art_id: &str) -> PathBuf {
-    crate::cache::art_hires_dir().join(format!("{art_id}.{MODEL}.png"))
-}
-
-/// Upscale `src_bytes` 4×. Blocking and GPU-bound — call from `spawn_blocking`.
+/// Upscale a cover 4× and hand back RGBA pixels ready for the GPU.
 ///
-/// Returns the PNG bytes, or `None` if anything at all went wrong.
-pub fn upscale(art_id: &str, src_bytes: &[u8]) -> Option<Vec<u8>> {
-    let out_path = cached_path(art_id);
-    if let Ok(bytes) = std::fs::read(&out_path) {
-        return Some(bytes);
-    }
+/// Blocking and GPU-bound — ~12s on a 2000px master, so call it from a worker thread, never the UI
+/// thread. Returns `None` if anything at all went wrong.
+///
+/// The tool is file-in/file-out, so this stages both sides on disk and deletes them; the PNG it
+/// writes is streamed straight into the decoder rather than read into a `Vec` first, so the
+/// compressed bytes and the 256MB of pixels never coexist.
+pub fn upscale_image(art_id: &str, src_bytes: &[u8]) -> Option<image::RgbaImage> {
     if !available() {
         return None;
     }
-
-    let dir = crate::cache::art_hires_dir();
+    let dir = crate::cache::scratch_dir();
     std::fs::create_dir_all(&dir).ok()?;
 
-    // The tool is file-in/file-out, so stage the source next to the target.
-    let in_path = dir.join(format!("{art_id}.in"));
+    // Unique per process: two covers upscaling back-to-back must not scribble on each other.
+    let stem = format!("{art_id}.{}", std::process::id());
+    let in_path = dir.join(format!("{stem}.in"));
+    let out_path = dir.join(format!("{stem}.out.png"));
     std::fs::write(&in_path, src_bytes).ok()?;
 
     let t0 = std::time::Instant::now();
+    let ok = run(&in_path, &out_path);
+    let _ = std::fs::remove_file(&in_path);
+
+    let decoded = ok
+        .then(|| {
+            std::fs::File::open(&out_path)
+                .ok()
+                .and_then(|f| image::load(BufReader::new(f), image::ImageFormat::Png).ok())
+                .map(|img| img.into_rgba8())
+        })
+        .flatten();
+    let _ = std::fs::remove_file(&out_path);
+
+    let img = decoded?;
+    tracing::info!(
+        "esrgan: {art_id} upscaled to {}×{} in {}ms ({}MB in VRAM)",
+        img.width(),
+        img.height(),
+        t0.elapsed().as_millis(),
+        (img.width() as usize * img.height() as usize * 4) / 1_000_000,
+    );
+    Some(img)
+}
+
+fn run(in_path: &Path, out_path: &Path) -> bool {
+    let (Some(i), Some(o)) = (in_path.to_str(), out_path.to_str()) else {
+        return false;
+    };
     let status = Command::new(BIN)
         .args([
-            "-i",
-            in_path.to_str()?,
-            "-o",
-            out_path.to_str()?,
-            "-n",
-            MODEL,
-            "-m",
-            MODELS_DIR,
-            "-s",
-            "4",
+            "-i", i, "-o", o, "-n", MODEL, "-m", MODELS_DIR, "-s", "4",
             // Explicit format: the tool infers from the extension, and a wrong guess writes garbage.
-            "-f",
-            "png",
+            "-f", "png",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    let _ = std::fs::remove_file(&in_path);
-
     match status {
-        Ok(s) if s.success() => {
-            let bytes = std::fs::read(&out_path).ok()?;
-            tracing::info!(
-                "esrgan: upscaled {art_id} 4x in {}ms ({} KB)",
-                t0.elapsed().as_millis(),
-                bytes.len() / 1024
-            );
-            Some(bytes)
-        }
+        Ok(s) if s.success() => true,
         Ok(s) => {
             tracing::warn!("esrgan: {BIN} exited {s}");
-            let _ = std::fs::remove_file(&out_path);
-            None
+            false
         }
         Err(e) => {
             tracing::warn!("esrgan: could not run {BIN}: {e}");
-            None
+            false
         }
     }
 }

@@ -87,17 +87,52 @@ struct App {
     show_nowpane: bool,
     /// Full-screen now-playing. The whole window becomes the album art.
     vibe: bool,
-    /// Blurred backdrop textures, keyed by art url — built once, reused.
-    blurred: HashMap<String, egui::TextureHandle>,
+    /// Blurred backdrop textures, keyed by art url — built once, reused. The `f32` is the
+    /// backdrop's mean luminance AFTER exposure, which decides how hard it gets scrimmed.
+    blurred: HashMap<String, (egui::TextureHandle, f32)>,
     /// The track whose "add to playlist" dialog is open, if any.
     add_to: Option<nocturne_api::Track>,
-    /// ESRGAN-upscaled covers, keyed by the original art url. Requested once per cover.
-    hires: HashMap<String, Option<egui::TextureHandle>>,
-    hires_pending: std::collections::HashSet<String>,
+    /// ESRGAN-upscaled covers resident in VRAM, keyed by art url.
+    ///
+    /// Deliberately bounded, and it is the *only* place an upscale lives — nothing is written to
+    /// disk. An 8000² RGBA texture is ~256MB, so this map IS the memory budget: only the covers in
+    /// [`App::hires_window`] are allowed in, and everything else is evicted the frame it falls out.
+    /// Without the eviction, every cover played this session would stay resident and a long listen
+    /// would eat VRAM until the GPU gave up.
+    hires: HashMap<String, egui::TextureHandle>,
+    /// Covers whose upscale failed. Never retried — a missing binary won't appear mid-session.
+    hires_failed: std::collections::HashSet<String>,
+    /// The one cover being upscaled right now. The GPU serialises these passes anyway, so running
+    /// six at once would only delay the one the user is actually looking at.
+    hires_inflight: Option<String>,
+    /// Queue entries we've already asked the backend to resolve a big cover for.
+    hires_asked: std::collections::HashSet<String>,
+    /// Workers hand back a decoded image; the UI thread owns the GPU upload.
+    hires_tx: std::sync::mpsc::Sender<(String, Option<egui::ColorImage>)>,
+    hires_rx: std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>,
 }
+
+/// The cover's corner radius, and the width of the plate it sits on.
+///
+/// These are shared by the art, the plate and the shadow on purpose — every "slightly off" square
+/// in a UI is two shapes that were rounded and inset independently.
+const ART_ROUNDING: f32 = 16.0;
+const PLATE: f32 = 10.0;
+/// The plate itself: a dark mat, translucent so the blurred backdrop still reads through it.
+const PLATE_FILL: Color32 = Color32::from_black_alpha(120);
+
+/// How many played tracks keep their upscaled cover, and how many upcoming ones get it built ahead.
+///
+/// Six 8000² covers resident is ~1.5GB of VRAM (of 16GB on the 4080) — that is the price of instant
+/// scrubbing in both directions, and it is the reason [`App::hires`] evicts rather than grows. A
+/// pass costs ~12s, which is why the next tracks are built during the current one and never waited
+/// on: until a cover's upscale lands, the view shows Spotify's master, which is sharp already.
+const HIRES_BACK: usize = 3;
+const HIRES_AHEAD: usize = 2;
 
 impl App {
     fn new(state: Shared, tx: tokio::sync::mpsc::UnboundedSender<Cmd>) -> Self {
+        let (tx8, rx8) = std::sync::mpsc::channel();
         Self {
             state,
             tx,
@@ -116,7 +151,11 @@ impl App {
             blurred: HashMap::new(),
             add_to: None,
             hires: HashMap::new(),
-            hires_pending: Default::default(),
+            hires_failed: Default::default(),
+            hires_inflight: None,
+            hires_asked: Default::default(),
+            hires_tx: tx8,
+            hires_rx: rx8,
         }
     }
 
@@ -193,57 +232,145 @@ impl App {
         Some(tex)
     }
 
-    /// The full-screen cover, upscaled 4× by Real-ESRGAN on the GPU.
+    /// The covers allowed to hold an 8× texture: the playing track, [`HIRES_AHEAD`] ahead of it and
+    /// [`HIRES_BACK`] behind, in priority order — current first, then forwards, then backwards.
     ///
-    /// Returns the original until the pass finishes (about a second on the 4080), so the view never
-    /// waits on it — the cover simply sharpens a moment after it appears.
-    fn art_hires(&mut self, ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
-        if let Some(hit) = self.hires.get(url) {
-            if let Some(t) = hit {
-                return Some(t.clone());
+    /// Priority is the whole trick. Everything in the window gets built eventually, but the GPU
+    /// runs one pass at a time, and the cover on screen must never wait behind a cover for a track
+    /// three skips ago.
+    fn hires_window(&self) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        let n = s.queue.len();
+        if n == 0 {
+            // Nothing queued (a bare resume, a single track): the only cover that matters is the
+            // one the now-playing pane is showing.
+            return s
+                .now
+                .as_ref()
+                .and_then(|t| t.art_big.clone())
+                .into_iter()
+                .collect();
+        }
+        let cur = s.qpos.min(n - 1);
+
+        let mut idx = vec![cur];
+        idx.extend((1..=HIRES_AHEAD).filter_map(|d| (cur + d < n).then_some(cur + d)));
+        idx.extend((1..=HIRES_BACK).filter_map(|d| cur.checked_sub(d)));
+
+        let mut out: Vec<String> = Vec::new();
+        for i in idx {
+            // An album's tracks share a cover, so the window is often fewer than six distinct URLs
+            // — which is a straight VRAM saving, not a bug.
+            if let Some(u) = s.queue[i].art_big.clone() {
+                if !out.contains(&u) {
+                    out.push(u);
+                }
             }
-            return self.art(ctx, url); // upscale failed once; don't retry forever
+        }
+        out
+    }
+
+    /// Keep the resident 8× set equal to the window: land finished passes, evict what fell out,
+    /// and start at most one new pass. Called once per frame.
+    fn hires_sync(&mut self, ctx: &egui::Context) {
+        // 1. Land whatever the workers finished. The upload is the UI thread's job — it owns the
+        //    egui context — but the decode already happened off-thread, so this is a memcpy.
+        while let Ok((url, image)) = self.hires_rx.try_recv() {
+            match image {
+                Some(image) => {
+                    let tex =
+                        ctx.load_texture(format!("{url}#8x"), image, egui::TextureOptions::LINEAR);
+                    self.hires.insert(url.clone(), tex);
+                }
+                None => {
+                    self.hires_failed.insert(url.clone());
+                }
+            }
+            if self.hires_inflight.as_deref() == Some(url.as_str()) {
+                self.hires_inflight = None;
+            }
         }
 
-        // Kick the pass off exactly once per cover.
-        if !self.hires_pending.contains(url) {
-            let bytes = self.state.lock().unwrap().art.get(url).cloned();
-            if let Some(bytes) = bytes {
-                self.hires_pending.insert(url.to_string());
-                let art_id = url.rsplit('/').next().unwrap_or("art").to_string();
-                let url_owned = url.to_string();
-                let state = self.state.clone();
-                let ctx2 = ctx.clone();
-                std::thread::spawn(move || {
-                    let out = upscale::upscale(&art_id, &bytes);
-                    if let Some(png) = out {
-                        state
-                            .lock()
-                            .unwrap()
-                            .art
-                            .insert(format!("{url_owned}#hires"), png);
-                        ctx2.request_repaint();
+        let window = self.hires_window();
+
+        // 2. Evict. Dropping the handle frees the texture — this is what keeps a long listening
+        //    session from growing without bound.
+        self.hires.retain(|url, _| window.contains(url));
+
+        // 3. Ask the backend to resolve + stream source art for window tracks that don't have it.
+        //    Queued-but-unplayed tracks usually have no big cover URL yet.
+        let want: Vec<usize> = {
+            let s = self.state.lock().unwrap();
+            let n = s.queue.len();
+            let cur = s.qpos.min(n.saturating_sub(1));
+            (cur.saturating_sub(HIRES_BACK)..=(cur + HIRES_AHEAD).min(n.saturating_sub(1)))
+                .filter(|&i| {
+                    s.queue.get(i).is_some_and(|t| {
+                        !self.hires_asked.contains(&t.uri)
+                            && t.art_big.as_ref().is_none_or(|u| !s.art.contains_key(u))
+                    })
+                })
+                .collect()
+        };
+        if !want.is_empty() {
+            let uris: Vec<String> = {
+                let s = self.state.lock().unwrap();
+                want.iter()
+                    .filter_map(|&i| s.queue.get(i).map(|t| t.uri.clone()))
+                    .collect()
+            };
+            self.hires_asked.extend(uris);
+            self.send(Cmd::PrefetchBigArt(want));
+        }
+
+        // 4. Start one pass, highest priority first. The 4× half is cached on disk, so a cover
+        //    coming back into the window (skipping backwards) only pays the 2× half.
+        if self.hires_inflight.is_none() {
+            for url in &window {
+                if self.hires.contains_key(url) || self.hires_failed.contains(url) {
+                    continue;
+                }
+                // Only upscale art the backend has confirmed is the best the CDN has. A resumed
+                // session's queue still carries 640px URLs whose bytes are already on disk, and
+                // upscaling one of those wastes a 12s pass on art we're about to replace.
+                let bytes = {
+                    let s = self.state.lock().unwrap();
+                    if !s.art_best.contains(url) {
+                        continue;
                     }
+                    s.art.get(url).cloned()
+                };
+                let Some(bytes) = bytes else {
+                    continue; // source art still in flight; try again next frame
+                };
+
+                let art_id = url.rsplit('/').next().unwrap_or("art").to_string();
+                let url = url.clone();
+                let (tx, ctx2) = (self.hires_tx.clone(), ctx.clone());
+                self.hires_inflight = Some(url.clone());
+                std::thread::spawn(move || {
+                    // Decode off the UI thread and hand over the finished pixels: the 8000² PNG
+                    // never crosses a thread boundary, and never lands in shared state.
+                    let image = upscale::upscale_image(&art_id, &bytes).map(|img| {
+                        let size = [img.width() as usize, img.height() as usize];
+                        egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())
+                    });
+                    let _ = tx.send((url, image));
+                    ctx2.request_repaint();
                 });
+                break;
             }
         }
+    }
 
-        // Has the worker landed it yet?
-        let key = format!("{url}#hires");
-        let bytes = self.state.lock().unwrap().art.get(&key).cloned();
-        if let Some(bytes) = bytes {
-            if let Ok(img) = image::load_from_memory(&bytes) {
-                let img = img.to_rgba8();
-                let size = [img.width() as usize, img.height() as usize];
-                let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-                let tex = ctx.load_texture(&key, color, egui::TextureOptions::LINEAR);
-                self.hires.insert(url.to_string(), Some(tex.clone()));
-                self.hires_pending.remove(url);
-                return Some(tex);
-            }
+    /// The full-screen cover: the 8× if it's resident, the original otherwise.
+    ///
+    /// Never blocks on the upscale — the view opens on the 640px cover and sharpens a moment later,
+    /// which is why [`App::hires_sync`] builds the next tracks' covers before they're needed.
+    fn art_hires(&mut self, ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
+        if let Some(tex) = self.hires.get(url) {
+            return Some(tex.clone());
         }
-
-        // Not ready (or not possible): the original, which is what the user sees today.
         self.art(ctx, url)
     }
 
@@ -312,7 +439,8 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply(ctx);
         polish(ctx);
-        chrome::title_bar(ctx, "Nocturne");
+        // Keep the resident 8× covers in step with the queue, wherever the user just skipped to.
+        self.hires_sync(ctx);
 
         let (logged_in, busy, status, now, view, current) = {
             let s = self.state.lock().unwrap();
@@ -325,6 +453,16 @@ impl eframe::App for App {
                 s.current_uri.clone(),
             )
         };
+
+        // The vibe screen is the full-screen view, and full screen means CHROMELESS: the album art
+        // goes edge to edge with no title strip cutting the top off. The bar becomes an overlay
+        // that wipes in when you reach for the top edge, so close/min/max are still a flick away.
+        // Everywhere else (browse, and the sign-in screen) keeps the normal bar, which has to be
+        // built here — before any content — because it's a panel and panels claim layout first.
+        let chromeless = logged_in && self.vibe;
+        if !chromeless {
+            chrome::title_bar(ctx, "Nocturne");
+        }
 
         if !logged_in && !self.autologin_tried {
             self.autologin_tried = true;
@@ -353,6 +491,8 @@ impl eframe::App for App {
             }
             self.vibe_view(ctx, now.clone());
             self.add_dialog(ctx);
+            // After the content — an Area paints in call order, and this one floats on top of it.
+            chrome::title_bar_overlay(ctx, "Nocturne");
             if now.is_some_and(|n| !n.paused) {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
@@ -1000,7 +1140,13 @@ impl App {
     ///
     /// Blur is done by downscaling hard and letting the GPU's bilinear filter scale it back up:
     /// a 24px image stretched across 1300px IS a blur, for free, with no convolution pass.
-    fn backdrop(&mut self, ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
+    ///
+    /// Returns the texture and its mean luminance, because a fixed scrim can't work for every
+    /// cover: a night scene averages ~8% luminance, and 130/255 of black on top of that is a
+    /// backdrop you can't see. So the downscaled image is *exposed* to a target mean first —
+    /// gained up if it's dark, left alone if it's already bright — and the caller scales its
+    /// scrim by what came out.
+    fn backdrop(&mut self, ctx: &egui::Context, url: &str) -> Option<(egui::TextureHandle, f32)> {
         if let Some(t) = self.blurred.get(url) {
             return Some(t.clone());
         }
@@ -1008,11 +1154,34 @@ impl App {
         let img = image::load_from_memory(&bytes).ok()?;
         // 12px, not 24: stretched across ~1300px that's a much softer blur, which is what stops
         // the backdrop competing with the cover in front of it.
-        let small = img.resize_exact(12, 12, image::imageops::FilterType::Triangle).to_rgba8();
+        let mut small = img.resize_exact(12, 12, image::imageops::FilterType::Triangle).to_rgba8();
+
+        let lum = |p: &image::Rgba<u8>| {
+            (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) / 255.0
+        };
+        let mean = |px: &image::RgbaImage| {
+            px.pixels().map(lum).sum::<f32>() / (px.width() * px.height()) as f32
+        };
+
+        // Auto-exposure. Capped at 2.4x so a nearly-black cover lifts into visibility without
+        // turning into grey soup, and never darkens a bright one (gain >= 1.0) — the complaint
+        // was only ever that dark art vanishes.
+        const TARGET: f32 = 0.30;
+        let before = mean(&small).max(0.01);
+        let gain = (TARGET / before).clamp(1.0, 2.4);
+        if gain > 1.0 {
+            for p in small.pixels_mut() {
+                for c in 0..3 {
+                    p[c] = (p[c] as f32 * gain).min(255.0) as u8;
+                }
+            }
+        }
+        let exposed = mean(&small);
+
         let color = egui::ColorImage::from_rgba_unmultiplied([12, 12], small.as_raw());
         let tex = ctx.load_texture(format!("blur-{url}"), color, egui::TextureOptions::LINEAR);
-        self.blurred.insert(url.to_string(), tex.clone());
-        Some(tex)
+        self.blurred.insert(url.to_string(), (tex.clone(), exposed));
+        Some((tex, exposed))
     }
 
     /// Full-screen now playing. The art is the interface.
@@ -1028,19 +1197,26 @@ impl App {
                     .as_ref()
                     .and_then(|n| n.art_big.clone().or_else(|| n.art_url.clone()))
                 {
-                    if let Some(bg) = self.backdrop(&ctx2, &url) {
+                    if let Some((bg, lum)) = self.backdrop(&ctx2, &url) {
                         egui::Image::new(&bg).paint_at(ui, full);
-                        // Flat scrim so anything on top stays readable…
+                        // The scrim exists to keep the text and controls readable — so it should
+                        // be as heavy as THIS backdrop needs and no heavier. A bright cover still
+                        // gets the full 130; a dark one, which was already readable and just came
+                        // out muddy, gets a fraction of it.
+                        let k = ((lum - 0.15) / 0.40).clamp(0.0, 1.0);
+                        let scrim = (48.0 + k * (130.0 - 48.0)) as u8;
+                        let foot = (100.0 + k * (165.0 - 100.0)) as u8;
                         ui.painter()
-                            .rect_filled(full, Rounding::ZERO, Color32::from_black_alpha(130));
+                            .rect_filled(full, Rounding::ZERO, Color32::from_black_alpha(scrim));
                         // …then a SMOOTH top-to-bottom darkening. This used to be a rect covering
                         // the bottom half, which drew a hard horizontal seam straight across the
-                        // middle of the window. A gradient has no edge to see.
+                        // middle of the window. A gradient has no edge to see. The foot stays
+                        // dark-ish on every cover, because the transport row sits in it.
                         vertical_gradient(
                             ui,
                             full,
                             Color32::from_black_alpha(0),
-                            Color32::from_black_alpha(165),
+                            Color32::from_black_alpha(foot),
                         );
                     }
                 }
@@ -1064,28 +1240,53 @@ impl App {
                     egui::pos2(full.center().x, full.min.y + 40.0 + art_size / 2.0),
                     Vec2::splat(art_size),
                 );
-                // Soft shadow under the cover — this is what makes it feel like an object.
-                ui.painter().rect_filled(
-                    art_rect.translate(Vec2::new(0.0, 14.0)).expand(6.0),
-                    Rounding::same(20.0),
-                    Color32::from_black_alpha(90),
-                );
-                // The big cover, run through Real-ESRGAN (4×, on the GPU) — Spotify's 640px master
-                // is soft when stretched across a 4K panel.
+                // The cover sits on a plate: a mat of even width on all four sides, with the same
+                // corner geometry as the art, and a soft shadow cast beneath the whole thing.
+                //
+                // The plate's radius is the art's plus its own width, because two rounded rects
+                // only look concentric if their radii differ by exactly the gap between them —
+                // share a radius and the corners visibly drift apart.
+                let plate_rect = art_rect.expand(PLATE);
+                let plate_rounding = Rounding::same(ART_ROUNDING + PLATE);
+
+                // Shadow: same shape as the plate, blurred rather than merely offset. The old
+                // version was a hard rect shoved 14px down, which read as a square that had
+                // slipped out from behind the art instead of a shadow under it.
+                ui.painter().add(egui::epaint::RectShape {
+                    rect: plate_rect.translate(Vec2::new(0.0, 10.0)),
+                    rounding: plate_rounding,
+                    fill: Color32::from_black_alpha(110),
+                    stroke: Stroke::NONE,
+                    blur_width: 28.0,
+                    fill_texture_id: egui::TextureId::default(),
+                    uv: egui::Rect::ZERO,
+                });
+                ui.painter()
+                    .rect_filled(plate_rect, plate_rounding, PLATE_FILL);
+
+                // The big cover: Spotify's original master (1800–2000px), upscaled 4× on the GPU
+                // when the pass has landed. Rounded to match the plate — painting it as a hard
+                // square inside a rounded plate was half the misalignment.
                 let big = n.art_big.clone().or_else(|| n.art_url.clone());
                 match big.as_ref().and_then(|u| self.art_hires(&ctx2, u)) {
                     Some(tex) => {
-                        ui.painter().image(
-                            tex.id(),
-                            art_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
+                        ui.painter().add(egui::epaint::RectShape {
+                            rect: art_rect,
+                            rounding: Rounding::same(ART_ROUNDING),
+                            fill: Color32::WHITE, // multiplied with the texture: leaves it as-is
+                            stroke: Stroke::NONE,
+                            blur_width: 0.0,
+                            fill_texture_id: tex.id(),
+                            uv: egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                        });
                     }
                     None => {
                         let mut aui =
                             ui.child_ui(art_rect, Layout::top_down(Align::Center), None);
-                        self.art_at(&mut aui, &ctx2, big.as_ref(), art_size, 16.0);
+                        self.art_at(&mut aui, &ctx2, big.as_ref(), art_size, ART_ROUNDING);
                     }
                 }
 

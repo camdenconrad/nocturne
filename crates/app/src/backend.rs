@@ -38,6 +38,10 @@ pub enum Cmd {
     ToggleLike(Track),
     /// Jump to a track already in the queue (clicking Up Next).
     JumpTo(usize),
+    /// Resolve the big-cover URL for these queued tracks and stream the art into the cache, so the
+    /// UI can upscale covers for tracks that haven't played yet. Carries queue indices, because the
+    /// resolved URL has to be written back onto the queue entry itself.
+    PrefetchBigArt(Vec<usize>),
     /// Restore the last listening session (queue, track, position) — paused.
     Resume,
     /// Show the list the currently-playing queue came from.
@@ -117,6 +121,13 @@ pub struct State {
     pub liked: std::collections::HashSet<String>,
     /// Decoded art bytes keyed by URL; the UI turns these into textures once.
     pub art: std::collections::HashMap<String, Vec<u8>>,
+    /// Art URLs that came out of [`cache::art_fetch_best`] — i.e. the best the CDN had, master or
+    /// otherwise.
+    ///
+    /// The UI upscales *only* these. A restored session hands us a queue whose `art_big` is still a
+    /// 640px URL from an older run, and whose bytes may already be on disk; without this gate the
+    /// UI happily burned a GPU pass upscaling the 640 before the master resolved a second later.
+    pub art_best: std::collections::HashSet<String>,
 }
 
 impl Default for State {
@@ -142,6 +153,7 @@ impl Default for State {
             radio_playlist: None,
             liked: Default::default(),
             art: Default::default(),
+            art_best: Default::default(),
         }
     }
 }
@@ -211,9 +223,15 @@ async fn run(
         let mut s = state.lock().unwrap();
         s.liked = local_added.iter().map(|t| t.uri.clone()).collect();
     }
-    // The current listening run, with how much of each track was actually heard. A skip is the
-    // only negative signal we get without asking the user anything.
+    // The current listening run, with how much of each track was actually heard. Only the finishes
+    // in it are ever learned — see `nocturne_taste::FINISHED`.
     let mut run: Vec<(Track, f32)> = Vec::new();
+    // URIs Nocturne itself chose for him: the mood playlist, plus anything radio autoplay appended.
+    // Finishing or liking one of these is feedback on the RECOMMENDER, not just on the song, so it
+    // trains at `OURS_WEIGHT`.
+    let mut ours: std::collections::HashSet<String> = cache::list_get::<RadioPlaylist>("radio-playlist")
+        .map(|p| p.tracks.iter().map(|t| t.uri.clone()).collect())
+        .unwrap_or_default();
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -254,7 +272,7 @@ async fn run(
                         busy(&st, &rp, format!("searching “{q}”…"));
                         set(&st, &rp, |s| s.view = format!("Search: {q}"));
                         match api.search_tracks(&q, 50).await {
-                            Ok(t) => finish_tracks(&st, &rp, t, &api).await,
+                            Ok(t) => finish_tracks(&st, &rp, t).await,
                             Err(e) => fail(&st, &rp, format!("search: {e}")),
                         }
                     }
@@ -315,7 +333,7 @@ async fn run(
                                         let _ = tx2.send(Cmd::Play(first.uri.clone()));
                                     }
                                 }
-                                finish_tracks(&st, &rp, t, &api).await
+                                finish_tracks(&st, &rp, t).await
                             }
                             Err(e) => fail(&st, &rp, format!("liked songs: {e}")),
                         }
@@ -392,8 +410,10 @@ async fn run(
                                 }
                             }
                             cache::list_put(&id, &t);
-                            if let Some(api) = api(&Some(h), &st, &rp).await {
-                                finish_tracks(&st, &rp, t, &api).await;
+                            // Still gated on being logged in, even though the art fetch no longer
+                            // needs the token — the CDN is public.
+                            if api(&Some(h), &st, &rp).await.is_some() {
+                                finish_tracks(&st, &rp, t).await;
                             }
                         }
                         Err(e) => fail(&st, &rp, format!("playlist: {e}")),
@@ -404,7 +424,7 @@ async fn run(
             Cmd::Play(uri) => {
                 if let Some(h) = &handle {
                     needs_load = false;
-                    record(&state, &mut run, &taste, &repaint);
+                    record(&state, &mut run, &ours, &taste, &repaint);
                     // Whatever list is on screen becomes the queue, starting at the clicked track.
                     queue = state.lock().unwrap().tracks.clone();
                     qpos = queue.iter().position(|t| t.uri == uri).unwrap_or(0);
@@ -456,7 +476,7 @@ async fn run(
             Cmd::Next => {
                 if let Some(h) = &handle {
                     needs_load = false;
-                    record(&state, &mut run, &taste, &repaint);
+                    record(&state, &mut run, &ours, &taste, &repaint);
                     if qpos + 1 < queue.len() {
                         qpos += 1;
                         paused = false;
@@ -479,39 +499,14 @@ async fn run(
                         match radio(h, &seed, &prev).await {
                             Ok(more) if !more.is_empty() => {
                                 // Spotify picks the candidates; his listening picks the order —
-                                // biased toward what he finishes, away from what he skips.
-                                let history: Vec<(Track, f32)> =
-                                    cache::list_get::<Vec<Vec<(Track, f32)>>>("history")
-                                        .unwrap_or_default()
-                                        .into_iter()
-                                        .flatten()
-                                        .collect();
-                                let more = {
-                                    let mut t = taste.lock().unwrap();
-                                    let ranked = t.rank(more);
-                                    if history.len() >= 8 {
-                                        // Once there's real history, drop anything close to what he
-                                        // skips rather than merely ranking it lower.
-                                        let dislikes = t.dislikes(&history);
-                                        ranked
-                                            .into_iter()
-                                            .filter(|tr| {
-                                                let Some(f) = t.features().get(
-                                                    nocturne_taste::track_id(&tr.uri),
-                                                ) else {
-                                                    return true;
-                                                };
-                                                let v = nocturne_taste::mood::acoustic_vec(f);
-                                                !dislikes
-                                                    .iter()
-                                                    .any(|d| v.cosine_similarity(d) > 0.97)
-                                            })
-                                            .collect()
-                                    } else {
-                                        ranked
-                                    }
-                                };
+                                // biased toward what he finishes and what he's hearted. Nothing is
+                                // filtered out for resembling a skip: that filter existed, and it
+                                // was a negative built from ambiguous evidence, which is exactly
+                                // what this model refuses to do.
+                                let more = taste.lock().unwrap().rank(more);
                                 tracing::info!("radio: queued {} more tracks", more.len());
+                                // These are OUR picks — finishing or liking one grades the model.
+                                ours.extend(more.iter().map(|t| t.uri.clone()));
                                 set(&state, &repaint, |s| {
                                     s.radio_loading = false;
                                     s.status = format!("radio: +{} tracks", more.len());
@@ -628,7 +623,7 @@ async fn run(
                     let seed_pool = ta
                         .lock()
                         .unwrap()
-                        .nearest_mood_for_me(&library, &target, &history, 25);
+                        .nearest_mood_for_me(&library, &target, &history, &phrase, 25);
                     if seed_pool.is_empty() {
                         fail(&st, &rp, "no analyzed tracks yet — still learning".into());
                         return;
@@ -674,8 +669,8 @@ async fn run(
                     let (new_ranked, fam_ranked) = {
                         let t = ta.lock().unwrap();
                         (
-                            t.nearest_mood_for_me(&candidates, &target, &history, 90),
-                            t.nearest_mood_for_me(&library, &target, &history, 40),
+                            t.nearest_mood_for_me(&candidates, &target, &history, &phrase, 90),
+                            t.nearest_mood_for_me(&library, &target, &history, &phrase, 40),
                         )
                     };
                     let new_picks = sample(&new_ranked, 45);
@@ -732,7 +727,16 @@ async fn run(
             Cmd::PlayQueue(tracks) => {
                 if let Some(h) = &handle {
                     needs_load = false;
-                    record(&state, &mut run, &taste, &repaint);
+                    record(&state, &mut run, &ours, &taste, &repaint);
+                    // If this queue IS the radio playlist we built, everything in it is ours.
+                    let radio_uris: std::collections::HashSet<String> = state
+                        .lock()
+                        .unwrap()
+                        .radio_playlist
+                        .as_ref()
+                        .map(|p| p.tracks.iter().map(|t| t.uri.clone()).collect())
+                        .unwrap_or_default();
+                    ours.extend(tracks.iter().filter(|t| radio_uris.contains(&t.uri)).map(|t| t.uri.clone()));
                     queue = tracks;
                     qpos = 0;
                     paused = false;
@@ -769,6 +773,31 @@ async fn run(
                     "local-unlikes",
                     &local_removed.iter().cloned().collect::<Vec<_>>(),
                 );
+
+                // A like is the least ambiguous thing he can tell us — nobody hits the heart by
+                // accident. So it trains immediately, not at the next window. Hearting a track our
+                // OWN radio served him is worth double: that's the model being told it was right.
+                //
+                // An un-like is NOT a negative. It's him tidying his library, months later, in a
+                // different mood — evidence about a list, not about music. We just stop counting
+                // the positive, and the model keeps whatever the finishes taught it.
+                if now_liked {
+                    let w = if ours.contains(&uri) {
+                        nocturne_taste::OURS_WEIGHT
+                    } else {
+                        1.0
+                    };
+                    let mut t = taste.lock().unwrap();
+                    t.learn_like(&track, w);
+                    if let Err(e) = t.save(&cache::model_path()) {
+                        tracing::warn!("taste: could not save model: {e}");
+                    }
+                    let n = t.trained_sequences();
+                    let endorsed = t.endorsements().len();
+                    drop(t);
+                    tracing::info!("taste: liked “{}” (weight {w}) — {endorsed} endorsements", track.name);
+                    set(&state, &repaint, |s| s.taste_trained = n);
+                }
 
                 // If Liked Songs is on screen, reflect it NOW — liking a track and not seeing it
                 // appear in your library is indistinguishable from the like not working.
@@ -844,19 +873,10 @@ async fn run(
                         }) else {
                             return;
                         };
-                        let bytes = match cache::art_get(&big) {
-                            Some(b) => Some(b),
-                            None => match reqwest::get(&big).await {
-                                Ok(r) => r.bytes().await.ok().map(|b| {
-                                    let b = b.to_vec();
-                                    cache::art_put(&big, &b);
-                                    b
-                                }),
-                                Err(_) => None,
-                            },
-                        };
-                        if let Some(bytes) = bytes {
+                        // The master, not the 640 — and `big` becomes whichever URL actually served.
+                        if let Some((big, bytes)) = cache::art_fetch_best(&big).await {
                             let mut s = st.lock().unwrap();
+                            s.art_best.insert(big.clone());
                             s.art.insert(big.clone(), bytes);
                             if let Some(n) = &mut s.now {
                                 n.art_big = Some(big);
@@ -954,11 +974,49 @@ async fn run(
                 });
             }
 
+            // The UI keeps 8× covers for a window around the playing track, so it needs the big
+            // cover for tracks it hasn't played yet. Resolving one costs an API call, so the UI
+            // asks only for the handful in its window, and only once each.
+            Cmd::PrefetchBigArt(idxs) => {
+                if let Some(h) = handle.clone() {
+                    for i in idxs {
+                        let Some(t) = queue.get(i).cloned() else { continue };
+                        let (st, rp) = (state.clone(), repaint.clone());
+                        let h = h.clone();
+                        tokio::spawn(async move {
+                            let big = match t.art_big.clone() {
+                                Some(b) => Some(b),
+                                None => h.big_cover(&t.uri).await,
+                            };
+                            let Some(big) = big else { return };
+
+                            let Some((big, bytes)) = cache::art_fetch_best(&big).await else {
+                                return;
+                            };
+
+                            // Write the resolved URL back onto the queue entry: it is the key the
+                            // UI's resident window is built from, so without this the cover is
+                            // invisible to the upscaler no matter how many times we fetch its bytes.
+                            let mut s = st.lock().unwrap();
+                            if let Some(q) = s.queue.get_mut(i) {
+                                if q.uri == t.uri {
+                                    q.art_big = Some(big.clone());
+                                }
+                            }
+                            s.art_best.insert(big.clone());
+                            s.art.entry(big).or_insert(bytes);
+                            drop(s);
+                            rp();
+                        });
+                    }
+                }
+            }
+
             Cmd::JumpTo(i) => {
                 if let Some(h) = &handle {
                     needs_load = false;
                     if i < queue.len() {
-                        record(&state, &mut run, &taste, &repaint);
+                        record(&state, &mut run, &ours, &taste, &repaint);
                         qpos = i;
                         paused = false;
                         taste.lock().unwrap().observe(&queue[i]);
@@ -995,19 +1053,23 @@ async fn run(
                         learned += 1;
                     }
                 }
-                // Liked Songs: not an ordering he chose, but a strong statement about what he
-                // likes at all. Learned as one sequence so its tracks enter the model's space.
-                if !t.has_learned("liked") {
-                    if let Some(liked) = cache::list_get::<Vec<Track>>("liked") {
+                // Liked Songs: not an ordering he chose, but the clearest statement he's ever made
+                // about what he likes at all. Learned as one sequence so its tracks enter the
+                // model's space, AND folded into the positive set — re-seeded every launch, and
+                // again after each analysis backfill, because a track liked before its features
+                // arrived can only be embedded once they have.
+                if let Some(liked) = cache::list_get::<Vec<Track>>("liked") {
+                    if !t.has_learned("liked") {
                         t.learn_corpus("liked", &liked);
                         learned += 1;
                     }
+                    t.seed_endorsements(&liked);
                 }
 
-                // Past listening runs, replayed with their outcomes.
+                // Past listening runs — replayed, finishes only.
                 if let Some(history) = cache::list_get::<Vec<Vec<(Track, f32)>>>("history") {
                     for past in history.iter().take(50) {
-                        t.learn_plays(past);
+                        t.learn_finishes(past, 1.0);
                     }
                 }
                 let n = t.trained_sequences();
@@ -1054,14 +1116,18 @@ async fn run(
     }
 }
 
-/// Close out the currently-playing track: how much of it did he actually hear? That fraction is
-/// the reward signal — a track skipped at 5% and one played to the end mean opposite things, and
-/// it's the only feedback available without ever asking him to rate anything.
+/// Close out the currently-playing track: how much of it did he actually hear?
+///
+/// The full completion fraction is *stored* — history is a record, and a later idea about what a
+/// 40% play means shouldn't be foreclosed now. But only the finishes are *learned*: the model
+/// trains on tracks he sat all the way through, and a skip teaches it nothing at all
+/// (`nocturne_taste::FINISHED` explains why).
 ///
 /// Runs are learned (and persisted) once they're long enough to carry a pattern.
 fn record(
     state: &Shared,
     run: &mut Vec<(Track, f32)>,
+    ours: &std::collections::HashSet<String>,
     taste: &Arc<Mutex<Taste>>,
     repaint: &(impl Fn() + Send),
 ) {
@@ -1078,11 +1144,53 @@ fn record(
         last.1 = completion;
     }
 
+    // A fast skip of a track from the current MOOD radio is evidence about the mood, not the
+    // track: a summer lofi song in a "winter chill lofi" station is a fine song in the wrong
+    // room. File it under the phrase, where it can only ever affect that station again — the
+    // taste model itself never sees it.
+    if completion < nocturne_taste::QUICK_SKIP {
+        let mood = {
+            let s = state.lock().unwrap();
+            let uri = s.current_uri.clone();
+            s.radio_playlist
+                .as_ref()
+                .filter(|p| uri.as_ref().is_some_and(|u| p.tracks.iter().any(|t| &t.uri == u)))
+                .map(|p| p.phrase.clone())
+        };
+        if let (Some(phrase), Some((track, _))) = (mood, run.last()) {
+            tracing::info!(
+                "taste: “{}” skipped at {:.0}% — wrong for “{phrase}”, not wrong for him",
+                track.name,
+                completion * 100.0
+            );
+            taste.lock().unwrap().skip_in_mood(&phrase, track);
+        }
+    }
+
     // Learn in windows rather than waiting for the app to close — a session that's never cleanly
     // exited would otherwise teach the model nothing.
     if run.len() >= 4 {
+        // Did this run happen inside music Nocturne chose? If most of what he finished here came
+        // from our own radio, the run is grading the recommender, and it counts double.
+        let finished: Vec<&Track> = run
+            .iter()
+            .filter(|(_, c)| *c >= nocturne_taste::FINISHED)
+            .map(|(t, _)| t)
+            .collect();
+        let from_us = finished.iter().filter(|t| ours.contains(&t.uri)).count();
+        let weight = if !finished.is_empty() && from_us * 2 >= finished.len() {
+            nocturne_taste::OURS_WEIGHT
+        } else {
+            1.0
+        };
+
         let mut t = taste.lock().unwrap();
-        t.learn_plays(run);
+        let learned = t.learn_finishes(run, weight);
+        tracing::info!(
+            "taste: run of {} → learned {learned} finishes (weight {weight}), {} skips dropped",
+            run.len(),
+            run.len() - learned
+        );
         let mut history: Vec<Vec<(Track, f32)>> =
             cache::list_get("history").unwrap_or_default();
         history.push(run.clone());
@@ -1365,24 +1473,14 @@ fn start(
             };
             let Some(big) = big else { return };
 
-            if st.lock().unwrap().art.contains_key(&big) {
-                set_big(&st, &uri, &big);
-                rp();
-                return;
-            }
-            let bytes = match cache::art_get(&big) {
-                Some(b) => Some(b),
-                None => match reqwest::get(&big).await {
-                    Ok(r) => r.bytes().await.ok().map(|b| {
-                        let b = b.to_vec();
-                        cache::art_put(&big, &b);
-                        b
-                    }),
-                    Err(_) => None,
-                },
-            };
-            if let Some(bytes) = bytes {
-                st.lock().unwrap().art.insert(big.clone(), bytes);
+            // `art_fetch_best` serves from the disk cache when it can, so a repeat visit costs a
+            // file read, not a request — no need to short-circuit on `art` here.
+            if let Some((big, bytes)) = cache::art_fetch_best(&big).await {
+                {
+                    let mut s = st.lock().unwrap();
+                    s.art_best.insert(big.clone());
+                    s.art.entry(big.clone()).or_insert(bytes);
+                }
                 set_big(&st, &uri, &big);
                 rp();
             }
@@ -1513,7 +1611,6 @@ async fn finish_tracks(
     state: &Shared,
     repaint: &(impl Fn() + Send + Sync + Clone + 'static),
     tracks: Vec<Track>,
-    api: &Client,
 ) {
     let mut urls: Vec<String> = {
         let seen = state.lock().unwrap();
@@ -1553,19 +1650,14 @@ async fn finish_tracks(
 
     let state = state.clone();
     let repaint = repaint.clone();
-    let token = api.token().to_string();
     tokio::spawn(async move {
         use futures_util::StreamExt;
-        let art = Arc::new(Client::new(token));
+        // Streamed to disk as they arrive: 12 covers in flight, none of them buffered whole in RAM.
         let mut stream = futures_util::stream::iter(urls)
-            .map(|url| {
-                let art = art.clone();
-                async move { art.fetch_art(&url).await.ok().map(|b| (url, b)) }
-            })
+            .map(|url| async move { cache::art_fetch(&url).await.map(|b| (url, b)) })
             .buffer_unordered(12);
         while let Some(got) = stream.next().await {
             if let Some((url, bytes)) = got {
-                cache::art_put(&url, &bytes);
                 state.lock().unwrap().art.insert(url, bytes);
                 repaint();
             }
