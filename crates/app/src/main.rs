@@ -273,10 +273,29 @@ impl App {
     /// Keep the resident 8× set equal to the window: land finished passes, evict what fell out,
     /// and start at most one new pass. Called once per frame.
     fn hires_sync(&mut self, ctx: &egui::Context) {
+        // The window decides BOTH what we upload and what we evict, so it is computed once, up
+        // front, and the two steps below agree by construction. They must: uploading a texture and
+        // freeing it again within one frame is a crash, not a waste. egui hands the upload to the
+        // queue as a pending write, but `free_texture` destroys the texture outright — and it runs
+        // before the frame is submitted, so the submit trips over a write into destroyed memory:
+        //
+        //     Error in Queue::submit: Texture with 'egui_texid_Managed(3)' label has been destroyed
+        //
+        // A pass takes 10–20s. Skip a track while one is running and it lands on a cover that left
+        // the window long ago — which is how a routine skip took the whole app down.
+        let window = self.hires_window();
+
         // 1. Land whatever the workers finished. The upload is the UI thread's job — it owns the
         //    egui context — but the decode already happened off-thread, so this is a memcpy.
         while let Ok((url, image)) = self.hires_rx.try_recv() {
+            if self.hires_inflight.as_deref() == Some(url.as_str()) {
+                self.hires_inflight = None;
+            }
             match image {
+                // Out of the window already: drop the pixels on the floor rather than upload 256MB
+                // we would evict two lines from now. If the cover comes back, so does the pass —
+                // it is not recorded as a failure.
+                Some(_) if !window.contains(&url) => {}
                 Some(image) => {
                     let tex =
                         ctx.load_texture(format!("{url}#8x"), image, egui::TextureOptions::LINEAR);
@@ -286,15 +305,11 @@ impl App {
                     self.hires_failed.insert(url.clone());
                 }
             }
-            if self.hires_inflight.as_deref() == Some(url.as_str()) {
-                self.hires_inflight = None;
-            }
         }
 
-        let window = self.hires_window();
-
         // 2. Evict. Dropping the handle frees the texture — this is what keeps a long listening
-        //    session from growing without bound.
+        //    session from growing without bound. Safe against the crash above because nothing
+        //    uploaded this frame is outside `window`.
         self.hires.retain(|url, _| window.contains(url));
 
         // 3. Ask the backend to resolve + stream source art for window tracks that don't have it.
