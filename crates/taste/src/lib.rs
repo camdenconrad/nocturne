@@ -141,10 +141,51 @@ struct ModelFile {
     /// listening — and the count grew without bound.
     #[serde(default)]
     learned: HashSet<String>,
+    /// Acoustic vectors of the endorsed tracks — see [`Taste::endorsements`].
+    #[serde(default)]
+    endorsed: Vec<watchtower::Tensor>,
+    /// URIs behind `endorsed`, so the same track can't be counted twice.
+    #[serde(default)]
+    endorsed_uris: HashSet<String>,
+    /// Per-mood misfits — see [`Taste::skip_in_mood`]. Keyed by mood phrase, NOT global.
+    #[serde(default)]
+    mood_skips: HashMap<String, Vec<watchtower::Tensor>>,
 }
 
 /// Bump when the embedding changes meaning.
-const MODEL_VERSION: u32 = 1;
+///
+/// v2: positives-only. The model no longer carries skip-derived negatives, so a v1 file's tree is
+/// the wrong shape of thing — it was trained against outcomes that included ambiguity.
+const MODEL_VERSION: u32 = 2;
+
+/// What counts as a finish.
+///
+/// # Why Nocturne only ever learns from positives
+///
+/// Completion is the honest signal: nobody accidentally listens to a whole track. A skip is not
+/// its opposite — it's *ambiguous*. He skipped because the phone rang, because it's the wrong
+/// hour for it, because he's heard it twice today, because someone walked in. Train on that and
+/// the model learns "he hates this" from an event that meant nothing, and there is no later
+/// evidence that can undo it: a wrong negative permanently carves a hole in taste space.
+///
+/// So skips are *dropped*, not learned. Every training example Nocturne accepts is unambiguous —
+/// a finish, or a like. It learns strictly slower. It never poisons itself.
+///
+/// The one exception is [`Taste::skip_in_mood`], and it's an exception that proves the rule: a
+/// skip inside a *mood* radio is unambiguous about the mood even when it says nothing about the
+/// track. That evidence is kept where it belongs — scoped to the phrase — and never allowed near
+/// the taste model.
+pub const FINISHED: f32 = 0.85;
+
+/// A skip fast enough to mean "not this, not here" rather than "I drifted off".
+pub const QUICK_SKIP: f32 = 0.25;
+
+/// How much more a positive is worth when it happened inside a list *Nocturne itself* built.
+///
+/// Finishing a track he chose says he likes the track. Finishing one the model served him says
+/// the model was right — that's feedback on the recommendation, not just the song, and it's the
+/// only signal here that grades the thing we're actually trying to improve.
+pub const OURS_WEIGHT: f32 = 2.0;
 
 pub struct Taste {
     tree: TensorSequenceTree,
@@ -155,6 +196,12 @@ pub struct Taste {
     features: HashMap<String, AudioFeatures>,
     /// Keys of corpora already learned (playlist ids, "liked"), so relaunches don't double-count.
     learned: HashSet<String>,
+    /// Acoustic vectors of tracks he finished or liked — the positive set, used as a prior at
+    /// ranking time. Nothing he skipped ever lands here.
+    endorsed: Vec<watchtower::Tensor>,
+    endorsed_uris: HashSet<String>,
+    /// mood phrase → tracks that didn't fit THAT mood. Deliberately not a taste signal.
+    mood_skips: HashMap<String, Vec<watchtower::Tensor>>,
 }
 
 impl Default for Taste {
@@ -182,6 +229,9 @@ impl Taste {
             trained_sequences: 0,
             features: HashMap::new(),
             learned: HashSet::new(),
+            endorsed: Vec::new(),
+            endorsed_uris: HashSet::new(),
+            mood_skips: HashMap::new(),
         }
     }
 
@@ -197,16 +247,29 @@ impl Taste {
             }
         };
         if model.version != MODEL_VERSION || model.dims != DIMS {
+            // The TREE is version-bound — trained against an embedding layout (or, across v1→v2, a
+            // reward signal) this build no longer means. Throw it away.
+            //
+            // The FEATURES are not. They're Spotify's raw analysis of a track, immutable and
+            // version-independent, and they cost hours of background backfill to collect. Carrying
+            // them across the bump means a retrain is a few seconds of CPU instead of re-fetching
+            // the entire library.
             tracing::warn!(
-                "taste: model is v{} dims={} but this build is v{MODEL_VERSION} dims={DIMS} — retraining",
+                "taste: model is v{} dims={} but this build is v{MODEL_VERSION} dims={DIMS} — \
+                 discarding the tree, keeping {} analyzed tracks",
                 model.version,
-                model.dims
+                model.dims,
+                model.features.len()
             );
-            return None;
+            return Some(Self {
+                features: model.features,
+                ..Self::new()
+            });
         }
         tracing::info!(
-            "taste: loaded model ({} sequences, {} tracks with analysis)",
+            "taste: loaded model ({} sequences, {} endorsements, {} tracks with analysis)",
             model.trained_sequences,
+            model.endorsed.len(),
             model.features.len()
         );
         Some(Self {
@@ -215,6 +278,9 @@ impl Taste {
             trained_sequences: model.trained_sequences,
             features: model.features,
             learned: model.learned,
+            endorsed: model.endorsed,
+            endorsed_uris: model.endorsed_uris,
+            mood_skips: model.mood_skips,
         })
     }
 
@@ -230,6 +296,9 @@ impl Taste {
             features: self.features.clone(),
             trained_sequences: self.trained_sequences,
             learned: self.learned.clone(),
+            endorsed: self.endorsed.clone(),
+            endorsed_uris: self.endorsed_uris.clone(),
+            mood_skips: self.mood_skips.clone(),
         };
         serde_json::to_vec(&model)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -313,16 +382,149 @@ impl Taste {
         self.trained_sequences += 1;
     }
 
-    /// Learn from what actually happened: a run of plays, rewarded by how much of each was heard.
-    /// A skipped track is a *negative* example — that's the signal a plain playlist can't give.
-    pub fn learn_plays(&mut self, plays: &[(Track, f32)]) {
-        if plays.len() < 2 {
+    /// Learn from what actually happened — but **only from the finishes**.
+    ///
+    /// A run of plays comes in; the skips are thrown away and what's left is the sequence of
+    /// tracks he sat through, learned as an unambiguous positive (outcome 1.0). See [`FINISHED`]
+    /// for why the skips aren't turned into negatives instead.
+    ///
+    /// Dropping the skips also repairs the *sequence*: the tree is a sequence learner, and a run
+    /// with three abandoned tracks in the middle of it was teaching the tree that those tracks
+    /// follow each other. They don't. What follows what, for him, is the finishes.
+    ///
+    /// `weight` is how many times this evidence counts — [`OURS_WEIGHT`] when the run happened
+    /// inside a list Nocturne built, 1.0 when he picked the list himself.
+    ///
+    /// Returns how many finishes were learned (0 if the run was all skips — that's a no-op, not
+    /// a failure).
+    pub fn learn_finishes(&mut self, plays: &[(Track, f32)], weight: f32) -> usize {
+        let finished: Vec<&Track> = plays
+            .iter()
+            .filter(|(_, c)| *c >= FINISHED)
+            .map(|(t, _)| t)
+            .collect();
+
+        // Every finish is an endorsement, even a lone one — it still tells the ranker something,
+        // it just can't teach the tree anything sequential.
+        for t in &finished {
+            self.endorse_vec(t);
+        }
+        if finished.len() < 2 {
+            return finished.len();
+        }
+
+        let seq: Vec<Tensor> = finished.iter().map(|t| self.vec_of(t)).collect();
+        for _ in 0..weight.round().max(1.0) as usize {
+            self.tree.learn_with_outcome(&seq, 1.0);
+            self.trained_sequences += 1;
+        }
+        finished.len()
+    }
+
+    /// He hit the heart. The single least ambiguous thing he can tell us, so it's learned
+    /// immediately rather than waiting for a training window to fill.
+    ///
+    /// The liked track is learned as the *continuation* of what he was listening to when he liked
+    /// it — that's the sequence the tree is built to model, and it's exactly the claim "after
+    /// this run of music, this track was the right thing to hear". `weight` should be
+    /// [`OURS_WEIGHT`] when the track came from a list Nocturne built: liking something the model
+    /// found is the strongest evidence in the whole system that it's working.
+    pub fn learn_like(&mut self, track: &Track, weight: f32) {
+        self.endorse_vec(track);
+
+        let mut seq: Vec<Tensor> = self.context.iter().rev().take(4).rev().cloned().collect();
+        seq.push(self.vec_of(track));
+        if seq.len() < 2 {
             return;
         }
-        let seq: Vec<Tensor> = plays.iter().map(|(t, _)| self.vec_of(t)).collect();
-        let outcome = plays.iter().map(|(_, c)| *c).sum::<f32>() / plays.len() as f32;
-        self.tree.learn_with_outcome(&seq, outcome);
-        self.trained_sequences += 1;
+        for _ in 0..weight.round().max(1.0) as usize {
+            self.tree.learn_with_outcome(&seq, 1.0);
+            self.trained_sequences += 1;
+        }
+    }
+
+    /// Add a track to the positive set (deduped). No-op for tracks with no analysis yet — the
+    /// backfill will have their features later, and [`Taste::seed_endorsements`] re-seeds then.
+    fn endorse_vec(&mut self, track: &Track) {
+        if self.endorsed_uris.contains(&track.uri) {
+            return;
+        }
+        let Some(f) = self.features.get(track_id(&track.uri)) else {
+            return;
+        };
+        let v = mood::acoustic_vec(f);
+        self.endorsed_uris.insert(track.uri.clone());
+        self.endorsed.push(v);
+    }
+
+    /// Fold his existing Liked Songs into the positive set. Idempotent — safe to call every launch
+    /// and after every analysis backfill, which is the point: tracks liked before their features
+    /// arrived get picked up as soon as they do.
+    pub fn seed_endorsements(&mut self, liked: &[Track]) {
+        for t in liked {
+            self.endorse_vec(t);
+        }
+    }
+
+    /// Everything he has finished or liked, as acoustic vectors. The positive set — the whole
+    /// training signal, and there is deliberately no negative counterpart.
+    pub fn endorsements(&self) -> &[watchtower::Tensor] {
+        &self.endorsed
+    }
+
+    /// He skipped this track inside the "`phrase`" radio, and skipped it fast.
+    ///
+    /// This is the one negative Nocturne records, and it's a negative about the **mood**, not
+    /// about him. A summer lofi track in a "winter chill lofi" station gets skipped in ten
+    /// seconds — and that skip means "wrong for this", not "wrong for me". It's a perfectly good
+    /// track and he'd happily hear it tomorrow.
+    ///
+    /// So the evidence is filed under the phrase and used only when that phrase is asked for
+    /// again. It never reaches the tree, never becomes an endorsement, never touches the taste
+    /// centroid, and never affects any other station. The global model still only learns from
+    /// finishes and likes — [`FINISHED`].
+    pub fn skip_in_mood(&mut self, phrase: &str, track: &Track) {
+        let Some(f) = self.features.get(track_id(&track.uri)) else {
+            return;
+        };
+        let v = mood::acoustic_vec(f);
+        let misfits = self.mood_skips.entry(phrase.to_lowercase()).or_default();
+        // Bounded, newest-wins: a mood he's been running for months shouldn't accumulate an
+        // ever-growing veto list built out of one bad afternoon each.
+        misfits.push(v);
+        let len = misfits.len();
+        if len > 40 {
+            misfits.drain(..len - 40);
+        }
+    }
+
+    /// How badly does this track resemble something he skipped out of *this* mood before?
+    fn mood_misfit(&self, phrase: &str, v: &watchtower::Tensor) -> f32 {
+        self.mood_skips
+            .get(&phrase.to_lowercase())
+            .map(|skips| {
+                skips
+                    .iter()
+                    .map(|s| v.cosine_similarity(s))
+                    .fold(0.0f32, f32::max)
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// How close is this track to something he has actually endorsed? 0.0 if we can't tell.
+    fn endorsement_affinity(&self, track: &Track) -> f32 {
+        if self.endorsed.is_empty() {
+            return 0.0;
+        }
+        let Some(f) = self.features.get(track_id(&track.uri)) else {
+            return 0.0;
+        };
+        let v = mood::acoustic_vec(f);
+        self.endorsed
+            .iter()
+            .map(|e| v.cosine_similarity(e))
+            .fold(f32::MIN, f32::max)
+            .max(0.0)
     }
 
     /// Note a track as it plays, building the live context for the next prediction.
@@ -376,9 +578,9 @@ impl Taste {
     /// whatever else you're listening to. Hence *worse* than chance.
     ///
     /// So ranking uses the acoustic embedding directly, which is where the real signal lives. The
-    /// tree keeps learning real *listening runs* (time-ordered, with skips) via [`Taste::learn_plays`]
-    /// — the data it's actually built for — and [`Taste::tree_agrees`] lets it contribute a tiebreak
-    /// once enough of those exist to be worth trusting. Re-run the diagnose example to check.
+    /// tree keeps learning real *finished* listening runs via [`Taste::learn_finishes`] — the data
+    /// it's actually built for — and [`Taste::tree_agrees`] lets it contribute a tiebreak once
+    /// enough of those exist to be worth trusting. Re-run the diagnose example to check.
     pub fn rank(&mut self, candidates: Vec<Track>) -> Vec<Track> {
         if candidates.is_empty() || self.context.is_empty() {
             return candidates;
@@ -389,16 +591,20 @@ impl Taste {
         // Decay was tried and measured: weighting the cosine by 0.6^age before taking the max
         // dropped accuracy from 69% to 56%, because a weighted max collapses toward "similar to
         // the single most recent track" instead of "fits the run". Left un-weighted deliberately.
+        //
+        // Plus a smaller pull toward what he's endorsed: "fits this run" is the brief, "and he has
+        // finished or hearted something that sounds like it" is the tiebreak. It's the only other
+        // term, because it's the only other thing we actually know.
         let mut scored: Vec<(f32, Track)> = candidates
             .into_iter()
             .map(|t| {
                 let v = self.vec_of(&t);
-                let score = self
+                let fit = self
                     .context
                     .iter()
                     .map(|c| v.cosine_similarity(c))
                     .fold(f32::MIN, f32::max);
-                (score, t)
+                (fit + 0.15 * self.endorsement_affinity(&t), t)
             })
             .collect();
 
@@ -414,8 +620,8 @@ impl Taste {
 
     /// The centroid of what he ACTUALLY finishes — his taste, as one point in acoustic space.
     ///
-    /// Built from listening history weighted by completion: a track played to the end pulls the
-    /// centroid toward it, a track skipped at 5% barely moves it.
+    /// Only finishes count, and they count equally: a partial play is not a partial endorsement,
+    /// it's an unknown. Anything under [`FINISHED`] contributes nothing at all.
     pub fn taste_centroid(&self, history: &[(Track, f32)]) -> Option<watchtower::Tensor> {
         let mut acc = vec![0.0f32; FEATURE_DIMS];
         let mut total = 0.0f32;
@@ -423,11 +629,10 @@ impl Taste {
             let Some(f) = self.features.get(track_id(&t.uri)) else {
                 continue;
             };
-            // Only finished-ish plays count as endorsement.
-            let w = *completion;
-            if w < 0.5 {
+            if *completion < FINISHED {
                 continue;
             }
+            let w = 1.0;
             let v = mood::acoustic_vec(f);
             for (i, x) in v.data.iter().enumerate().take(FEATURE_DIMS) {
                 acc[i] += x * w;
@@ -442,30 +647,28 @@ impl Taste {
         })
     }
 
-    /// Tracks he SKIPPED hard — the negative signal. Anything acoustically close to these is
-    /// probably something he'll hate too.
-    pub fn dislikes(&self, history: &[(Track, f32)]) -> Vec<watchtower::Tensor> {
-        history
-            .iter()
-            .filter(|(_, c)| *c < 0.25)
-            .filter_map(|(t, _)| self.features.get(track_id(&t.uri)).map(mood::acoustic_vec))
-            .collect()
-    }
-
-    /// Tracks nearest a **mood**, biased by his taste and away from what he skips.
+    /// Tracks nearest a **mood**, biased toward his taste.
     ///
     /// A pure mood match will happily serve him music that fits "chill lofi" perfectly and that he
-    /// would still hate. So the score is the mood match, pulled toward his taste centroid and
-    /// pushed away from tracks he's skipped.
+    /// would still hate. So the score is the mood match, pulled toward the music he finishes: his
+    /// completion-weighted centroid, plus a bonus for resembling something he specifically
+    /// endorsed (a finish or a like).
+    ///
+    /// The only push *away* from anything is mood-local: tracks resembling what he quick-skipped
+    /// out of THIS phrase before ([`Taste::skip_in_mood`]). The old global version of that penalty
+    /// — subtract `0.35 * worst_skip_similarity` over all history, and hard-filter anything within
+    /// 0.97 of a skipped track — is gone. It built a permanent, unfalsifiable negative out of
+    /// ambiguous evidence and let one bad afternoon blacklist a whole neighbourhood of his taste.
+    /// Scoped to the mood, the same evidence is sound: it only claims the track was wrong *here*.
     pub fn nearest_mood_for_me(
         &self,
         pool: &[Track],
         target: &watchtower::Tensor,
         history: &[(Track, f32)],
+        phrase: &str,
         count: usize,
     ) -> Vec<Track> {
         let centroid = self.taste_centroid(history);
-        let dislikes = self.dislikes(history);
 
         let mut scored: Vec<(f32, &Track)> = pool
             .iter()
@@ -481,15 +684,13 @@ impl Taste {
                     score += 0.25 * v.cosine_similarity(c);
                 }
 
-                // Push away from what he skips. Worst offender decides — one strong resemblance to
-                // a hated track is enough to bury it.
-                if let Some(worst) = dislikes
-                    .iter()
-                    .map(|d| v.cosine_similarity(d))
-                    .fold(None::<f32>, |m, x| Some(m.map_or(x, |m| m.max(x))))
-                {
-                    score -= 0.35 * worst;
-                }
+                // …and toward the nearest thing he endorsed outright.
+                score += 0.20 * self.endorsement_affinity(t);
+
+                // …and away from what didn't belong in THIS mood. A summer track in a winter
+                // station is still a good track — it's just not what he asked for.
+                score -= 0.30 * self.mood_misfit(phrase, &v);
+
                 Some((score, t))
             })
             .collect();
