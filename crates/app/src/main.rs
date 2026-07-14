@@ -6,7 +6,7 @@ mod icons;
 mod mpris;
 mod upscale;
 
-use backend::{Cmd, NowPlaying, Shared};
+use backend::{Cmd, NowPlaying, Repeat, Shared};
 use eframe::egui;
 use egui::{Align, Color32, Layout, Margin, RichText, Rounding, Stroke, Vec2};
 use livewall_uikit::{chrome, theme};
@@ -75,6 +75,8 @@ fn load_icon() -> egui::IconData {
 struct App {
     state: Shared,
     tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
+    /// False until we've told the compositor, once, that we are not a fullscreen window.
+    unfullscreened: bool,
     query: String,
     mood: String,
     textures: HashMap<String, egui::TextureHandle>,
@@ -85,7 +87,7 @@ struct App {
     volume: f32,
     show_sidebar: bool,
     show_nowpane: bool,
-    /// Full-screen now-playing. The whole window becomes the album art.
+    /// The now-playing view: the whole WINDOW becomes the album art. Not a compositor fullscreen.
     vibe: bool,
     /// Blurred backdrop textures, keyed by art url — built once, reused. The `f32` is the
     /// backdrop's mean luminance AFTER exposure, which decides how hard it gets scrimmed.
@@ -136,6 +138,7 @@ impl App {
         Self {
             state,
             tx,
+            unfullscreened: false,
             query: String::new(),
             mood: String::new(),
             textures: HashMap::new(),
@@ -389,6 +392,32 @@ impl App {
         self.art(ctx, url)
     }
 
+    /// Shuffle, as a switch. Sends the toggle; the backend owns the order.
+    fn shuffle_button(&self, ui: &mut egui::Ui, size: f32) {
+        let on = self.state.lock().unwrap().shuffle;
+        let hint = if on {
+            "Shuffle is on — click to play in list order (S)"
+        } else {
+            "Shuffle the rest of the queue (S)"
+        };
+        if mode_button(ui, Icon::Shuffle, size, on, hint) {
+            self.send(Cmd::SetShuffle(!on));
+        }
+    }
+
+    /// Repeat, cycling off → all → one. One button, three states — the icon says which.
+    fn repeat_button(&self, ui: &mut egui::Ui, size: f32) {
+        let mode = self.state.lock().unwrap().repeat;
+        let (icon, hint) = match mode {
+            Repeat::Off => (Icon::Repeat, "Repeat off — click to repeat the queue (R)"),
+            Repeat::All => (Icon::Repeat, "Repeating the queue — click to repeat this track (R)"),
+            Repeat::One => (Icon::RepeatOne, "Repeating this track — click for no repeat (R)"),
+        };
+        if mode_button(ui, icon, size, mode != Repeat::Off, hint) {
+            self.send(Cmd::CycleRepeat);
+        }
+    }
+
     fn art_at(
         &mut self,
         ui: &mut egui::Ui,
@@ -479,6 +508,23 @@ impl eframe::App for App {
             chrome::title_bar(ctx, "Nocturne");
         }
 
+        // The vibe view is "full screen" in the APP's language only — it fills Nocturne's window,
+        // not your monitor. It used to also drive `ViewportCommand::Fullscreen`, which meant that
+        // merely playing a track, hitting shuffle or clicking a cover blew the window up to take
+        // over the screen. Deciding to go fullscreen is the window manager's business and yours;
+        // it is not something a play button gets to do on your behalf.
+        //
+        // The cost is that rdock's bottom reveal strip is live again, under the transport row. That
+        // is the right trade: a dock that peeks is a nuisance, a window that hijacks the display is
+        // a fight.
+        //
+        // Say it out loud once, on the first frame: KWin remembers the fullscreen state an app last
+        // asked for and restores it on the next launch, so merely *not asking* leaves a window that
+        // an older Nocturne fullscreened still fullscreen, forever. This is what un-sticks it.
+        if !self.unfullscreened {
+            self.unfullscreened = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
         if !logged_in && !self.autologin_tried {
             self.autologin_tried = true;
             if nocturne_session::has_cached_login() {
@@ -867,6 +913,17 @@ impl App {
                             self.send(Cmd::PlayQueue(tracks.clone()));
                             self.vibe = true;
                         }
+                        // The "don't start me at track 1" button. Turns shuffle on FIRST, so the
+                        // queue this builds is already scrambled — the commands are handled in the
+                        // order they're sent.
+                        if !tracks.is_empty() {
+                            ui.add_space(8.0);
+                            if labeled_button(ui, Icon::Shuffle, "Shuffle") {
+                                self.send(Cmd::SetShuffle(true));
+                                self.send(Cmd::PlayQueue(tracks.clone()));
+                                self.vibe = true;
+                            }
+                        }
 
                         // Viewing the temp radio? Offer to make it permanent.
                         let radio = self.state.lock().unwrap().radio_playlist.clone();
@@ -1097,15 +1154,17 @@ impl App {
                 // sized slider (add_sized does NOT stretch a Slider — spacing.slider_width does),
                 // fixed-width times, and the right-hand one counting down.
                 let _ = cui;
+                const BMODE: f32 = 28.0;
                 const BSIDE: f32 = 32.0;
                 const BPLAY: f32 = 40.0;
                 const BGAP: f32 = 10.0;
                 let brow = egui::Rect::from_center_size(
                     egui::pos2(centre.center().x, centre.min.y + 26.0),
-                    Vec2::new(BSIDE * 2.0 + BPLAY + BGAP * 2.0, BPLAY),
+                    Vec2::new(BMODE * 2.0 + BSIDE * 2.0 + BPLAY + BGAP * 4.0, BPLAY),
                 );
                 let mut bui = ui.child_ui(brow, Layout::left_to_right(Align::Center), None);
                 bui.spacing_mut().item_spacing.x = BGAP;
+                self.shuffle_button(&mut bui, BMODE);
                 if icons::button(&mut bui, Icon::Prev, BSIDE, true).clicked() {
                     self.send(Cmd::Prev);
                 }
@@ -1116,6 +1175,7 @@ impl App {
                 if icons::button(&mut bui, Icon::Next, BSIDE, true).clicked() {
                     self.send(Cmd::Next);
                 }
+                self.repeat_button(&mut bui, BMODE);
 
                 let elapsed = n.elapsed_ms();
                 let remaining = n.duration_ms.saturating_sub(elapsed);
@@ -1397,16 +1457,20 @@ impl App {
                 // line instead of riding high.
                 // The row must be as tall as its TALLEST child, or a bigger play button cannot be
                 // vertically centred in it — it overflows and everything sits off the centre line.
+                // Shuffle and repeat flank the transport, unframed: they're modes, not actions, so
+                // they read as switches sitting either side of the buttons you press.
+                const MODE_BTN: f32 = 34.0;
                 const SIDE_BTN: f32 = 42.0;
                 const PLAY_BTN: f32 = 52.0;
                 const BTN_GAP: f32 = 12.0;
-                let row_w = SIDE_BTN * 2.0 + PLAY_BTN + BTN_GAP * 2.0;
+                let row_w = MODE_BTN * 2.0 + SIDE_BTN * 2.0 + PLAY_BTN + BTN_GAP * 4.0;
                 let row = egui::Rect::from_center_size(
                     egui::pos2(ctrl.center().x, ctrl.min.y + 62.0),
                     Vec2::new(row_w, PLAY_BTN),
                 );
                 let mut bui = ui.child_ui(row, Layout::left_to_right(Align::Center), None);
                 bui.spacing_mut().item_spacing.x = BTN_GAP;
+                self.shuffle_button(&mut bui, MODE_BTN);
                 if icons::button(&mut bui, Icon::Prev, SIDE_BTN, true).clicked() {
                     self.send(Cmd::Prev);
                 }
@@ -1417,6 +1481,7 @@ impl App {
                 if icons::button(&mut bui, Icon::Next, SIDE_BTN, true).clicked() {
                     self.send(Cmd::Next);
                 }
+                self.repeat_button(&mut bui, MODE_BTN);
 
                 // 5. The library tab. This is the ONLY way out — pop it, pick something, and the
                 //    app drops you straight back here.
@@ -1456,9 +1521,17 @@ impl App {
                 }
                 let _ = bg_click;
 
-                // Space = play/pause, the one shortcut every player has.
+                // Space = play/pause, the one shortcut every player has. S and R sit next to it: on
+                // the full-screen view there is no text field to steal them.
                 if ui.input(|i| i.key_pressed(egui::Key::Space)) {
                     self.send(Cmd::PlayPause);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::S)) {
+                    let on = self.state.lock().unwrap().shuffle;
+                    self.send(Cmd::SetShuffle(!on));
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::R)) {
+                    self.send(Cmd::CycleRepeat);
                 }
             });
     }
@@ -1556,6 +1629,38 @@ fn add_controls(
         app.request_add_to(track.clone());
     }
     let _ = playlists;
+}
+
+/// A transport MODE button (shuffle, repeat): unframed, orange when active, with a dot beneath it.
+///
+/// The colour alone isn't enough — an orange glyph on an album cover can read as a hover state, or
+/// as nothing at all on warm art. The dot is the unambiguous "this is on", and it's the same
+/// language every player uses.
+fn mode_button(ui: &mut egui::Ui, icon: Icon, box_size: f32, active: bool, hover: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(box_size), egui::Sense::click());
+    let t = ui.ctx().animate_bool(resp.id, active);
+
+    let color = if active {
+        theme::ORANGE
+    } else if resp.hovered() {
+        theme::ORANGE_HI
+    } else {
+        Color32::from_gray(155)
+    };
+    icons::paint(
+        &ui.painter().clone(),
+        rect.shrink(box_size * 0.26),
+        icon,
+        color,
+    );
+    if t > 0.0 {
+        ui.painter().circle_filled(
+            egui::pos2(rect.center().x, rect.max.y - 1.5),
+            2.0 * t,
+            theme::ORANGE,
+        );
+    }
+    resp.on_hover_text(hover).clicked()
 }
 
 /// A modern pill toggle — the kind every current app uses, instead of egui's default checkbox.

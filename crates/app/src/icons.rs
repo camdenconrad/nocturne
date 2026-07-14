@@ -26,6 +26,9 @@ pub enum Icon {
     Search,
     Radio,
     ChevronLeft,
+    Shuffle,
+    Repeat,
+    RepeatOne,
 }
 
 /// Paint `icon` centred in `rect`. `rect` is the *icon box*; the glyph is inset from it.
@@ -259,6 +262,78 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
                     }
                     p.add(egui::Shape::line(pts, stroke));
                 }
+            }
+        }
+        Icon::Shuffle => {
+            // Two paths that cross, each ending in an arrowhead on the right — the crossing IS the
+            // idea, so both strands run the full width and swap sides in the middle.
+            let (x0, x1) = (-r * 0.74, r * 0.5);
+            let y = r * 0.42;
+            let tip = r * 0.8;
+            for dir in [-1.0f32, 1.0] {
+                p.add(egui::Shape::line(
+                    vec![
+                        Pos2::new(c.x + x0, c.y + dir * y),
+                        Pos2::new(c.x + x0 * 0.45, c.y + dir * y),
+                        Pos2::new(c.x + x1 * 0.55, c.y - dir * y),
+                        Pos2::new(c.x + x1, c.y - dir * y),
+                    ],
+                    stroke,
+                ));
+                // A chevron, not a filled triangle: it shares the outline weight, so the arrow reads
+                // as part of the same stroke rather than a blob stuck on the end.
+                let a = r * 0.22;
+                p.add(egui::Shape::line(
+                    vec![
+                        Pos2::new(c.x + tip - a, c.y - dir * y - a),
+                        Pos2::new(c.x + tip, c.y - dir * y),
+                        Pos2::new(c.x + tip - a, c.y - dir * y + a),
+                    ],
+                    stroke,
+                ));
+            }
+        }
+        Icon::Repeat | Icon::RepeatOne => {
+            // A loop: two lines, rounded corners at opposite ends, a chevron on each far end. Point
+            // symmetry means the top and bottom halves are the same path, rotated 180°.
+            let (hw, hh) = (r * 0.68, r * 0.42);
+            let (cr, stub) = (r * 0.28, r * 0.1);
+            for dir in [-1.0f32, 1.0] {
+                // Each half is a short vertical, a quarter-turn, and the long line back — so the two
+                // halves meet in the middle of the sides and the loop closes without a hard corner.
+                let mut pts = vec![Pos2::new(c.x + dir * hw, c.y + dir * (hh - cr - stub))];
+                for i in 0..=6 {
+                    let a = std::f32::consts::FRAC_PI_2 * (i as f32 / 6.0);
+                    pts.push(Pos2::new(
+                        c.x + dir * (hw - cr + cr * a.cos()),
+                        c.y + dir * (hh - cr + cr * a.sin()),
+                    ));
+                }
+                pts.push(Pos2::new(c.x - dir * hw, c.y + dir * hh));
+                p.add(egui::Shape::line(pts, stroke));
+
+                let a = r * 0.22;
+                let (tx, ty) = (c.x - dir * hw, c.y + dir * hh);
+                p.add(egui::Shape::line(
+                    vec![
+                        Pos2::new(tx + dir * a, ty - a),
+                        Pos2::new(tx, ty),
+                        Pos2::new(tx + dir * a, ty + a),
+                    ],
+                    stroke,
+                ));
+            }
+            if icon == Icon::RepeatOne {
+                // A "1" inside the loop — the only thing that separates repeat-one from repeat-all.
+                let h = r * 0.24;
+                p.line_segment(
+                    [Pos2::new(c.x, c.y - h), Pos2::new(c.x, c.y + h)],
+                    Stroke::new(w * 0.9, color),
+                );
+                p.line_segment(
+                    [Pos2::new(c.x - h * 0.5, c.y - h * 0.45), Pos2::new(c.x, c.y - h)],
+                    Stroke::new(w * 0.9, color),
+                );
             }
         }
     }

@@ -52,6 +52,38 @@ pub enum Cmd {
     SaveRadioToSpotify,
     /// Add a track to a playlist. Local: Spotify 403s playlist writes for restricted apps too.
     AddToPlaylist(String, Track),
+    /// Shuffle the queue, or put it back in its original order.
+    SetShuffle(bool),
+    /// Off → All → One → Off.
+    CycleRepeat,
+    /// The player reached the end of a track by itself.
+    ///
+    /// NOT the same command as [`Cmd::Next`], and that distinction is the whole of repeat-one: a
+    /// track that ends plays again, but pressing ⏭ on it still moves you on. A player that ignores
+    /// your skip because repeat-one is set is a player fighting you.
+    TrackEnded,
+}
+
+/// What happens when the queue runs out.
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Repeat {
+    /// Stop — or hand over to radio, if it's on.
+    #[default]
+    Off,
+    /// Wrap around to the top of the queue.
+    All,
+    /// Play the current track again, forever.
+    One,
+}
+
+impl Repeat {
+    pub fn cycled(self) -> Self {
+        match self {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -105,8 +137,14 @@ pub struct State {
     /// True while the background analysis backfill is still running.
     pub analyzing: bool,
     /// The live queue and where we are in it — drives Up Next / History panels.
+    ///
+    /// When shuffle is on this IS the shuffled order: the queue is permuted in place rather than
+    /// read through an index map, so Up Next, the hi-res cover window, JumpTo and the saved session
+    /// all keep working off `queue`/`qpos` without knowing shuffle exists.
     pub queue: Vec<Track>,
     pub qpos: usize,
+    pub shuffle: bool,
+    pub repeat: Repeat,
     /// The current auto-generated radio playlist: a real, named list that lives only on this disk
     /// until the next radio replaces it. `None` until a radio has been built.
     pub radio_playlist: Option<RadioPlaylist>,
@@ -149,6 +187,8 @@ impl Default for State {
             analyzing: false,
             queue: Vec::new(),
             qpos: 0,
+            shuffle: false,
+            repeat: Repeat::default(),
             queue_view: String::new(),
             radio_playlist: None,
             liked: Default::default(),
@@ -193,6 +233,11 @@ async fn run(
     // advances through the playlist instead of falling silent.
     let mut queue: Vec<Track> = Vec::new();
     let mut qpos: usize = 0;
+    // The queue as the list gave it to us, kept aside while shuffle is on so turning shuffle off
+    // puts the album back in album order instead of freezing whatever jumble you were left with.
+    let mut order: Vec<Track> = Vec::new();
+    let mut shuffle = false;
+    let mut repeat = Repeat::Off;
     // Learned autoplay. Rebuilt from the on-disk playlist cache at startup rather than persisted:
     // the tree has no serialization, and it trains fast enough that the cache IS the model.
     // A saved model skips retraining entirely; a missing or stale one (different embedding layout)
@@ -234,6 +279,26 @@ async fn run(
         .unwrap_or_default();
 
     while let Some(cmd) = rx.recv().await {
+        // Repeat-one is the ONLY place a finished track differs from a pressed ⏭. Handle it here and
+        // let every other end-of-track fall through to `Next`, so auto-advance and the skip button
+        // stay one code path.
+        let cmd = match cmd {
+            Cmd::TrackEnded if repeat == Repeat::One && !queue.is_empty() => {
+                if let Some(h) = &handle {
+                    // The play that just ended was a finish: bank it before starting the next lap.
+                    record(&state, &mut run, &ours, &taste, &repaint);
+                    if let Some(t) = queue.get(qpos) {
+                        run.push((t.clone(), 0.0));
+                    }
+                    paused = false;
+                    start(&state, &repaint, h, &queue, qpos);
+                }
+                continue;
+            }
+            Cmd::TrackEnded => Cmd::Next,
+            other => other,
+        };
+
         match cmd {
             Cmd::Login => {
                 set(&state, &repaint, |s| {
@@ -428,6 +493,11 @@ async fn run(
                     // Whatever list is on screen becomes the queue, starting at the clicked track.
                     queue = state.lock().unwrap().tracks.clone();
                     qpos = queue.iter().position(|t| t.uri == uri).unwrap_or(0);
+                    // You picked THIS track, so it plays — shuffle only scrambles what comes after.
+                    order = queue.clone();
+                    if shuffle {
+                        shuffle_after(&mut queue, qpos);
+                    }
                     paused = false;
                     if let Some(t) = queue.get(qpos) {
                         taste.lock().unwrap().observe(t);
@@ -479,6 +549,19 @@ async fn run(
                     record(&state, &mut run, &ours, &taste, &repaint);
                     if qpos + 1 < queue.len() {
                         qpos += 1;
+                        paused = false;
+                        if let Some(t) = queue.get(qpos) {
+                            taste.lock().unwrap().observe(t);
+                            run.push((t.clone(), 0.0));
+                        }
+                        start(&state, &repaint, h, &queue, qpos);
+                    } else if repeat == Repeat::All && !queue.is_empty() {
+                        // Wrap. An explicit "repeat everything" outranks radio's guess at what to
+                        // play next — and a shuffled second lap gets a NEW order, or it isn't one.
+                        if shuffle {
+                            shuffle_from(&mut queue, 0);
+                        }
+                        qpos = 0;
                         paused = false;
                         if let Some(t) = queue.get(qpos) {
                             taste.lock().unwrap().observe(t);
@@ -546,8 +629,10 @@ async fn run(
                         .now
                         .as_ref()
                         .is_some_and(|n| n.elapsed_ms() < 3000);
-                    if near_start && qpos > 0 {
-                        qpos -= 1;
+                    if near_start && (qpos > 0 || (repeat == Repeat::All && queue.len() > 1)) {
+                        // Repeat-all makes the queue a ring: going back from the first track lands
+                        // on the last one.
+                        qpos = qpos.checked_sub(1).unwrap_or(queue.len() - 1);
                         start(&state, &repaint, h, &queue, qpos);
                     } else {
                         h.seek(0);
@@ -737,8 +822,14 @@ async fn run(
                         .map(|p| p.tracks.iter().map(|t| t.uri.clone()).collect())
                         .unwrap_or_default();
                     ours.extend(tracks.iter().filter(|t| radio_uris.contains(&t.uri)).map(|t| t.uri.clone()));
+                    order = tracks.clone();
                     queue = tracks;
                     qpos = 0;
+                    // "Play all" with shuffle on must not open on track 1 every time — there's no
+                    // chosen track to protect here, so the whole queue is shuffled, first included.
+                    if shuffle {
+                        shuffle_from(&mut queue, 0);
+                    }
                     paused = false;
                     if let Some(t) = queue.first() {
                         taste.lock().unwrap().observe(t);
@@ -827,6 +918,12 @@ async fn run(
                 queue = sess.queue.clone();
                 qpos = sess.qpos;
                 paused = true;
+                shuffle = sess.shuffle;
+                repeat = sess.repeat;
+                // The saved queue is already in play order, and the pre-shuffle order isn't saved
+                // with it — so turning shuffle off after a restart keeps the order you came back to
+                // rather than snapping to a list you last saw days ago.
+                order = queue.clone();
 
                 // Restore the UI to exactly where he left it — but PAUSED. Reopening an app should
                 // not start blasting music at you.
@@ -837,6 +934,8 @@ async fn run(
                 set(&state, &repaint, |s| {
                     s.queue = sess.queue.clone();
                     s.qpos = sess.qpos;
+                    s.shuffle = sess.shuffle;
+                    s.repeat = sess.repeat;
                     // Restore the QUEUE, not the browsed list. Setting `tracks` here overwrote the
                     // visible list with the queue while keeping the old view's name — which is how
                     // "Liked Songs" ended up showing 56 tracks instead of 2197. What you're
@@ -1029,6 +1128,65 @@ async fn run(
             Cmd::SetAutoplay(on) => {
                 set(&state, &repaint, |s| s.autoplay = on);
             }
+
+            Cmd::SetShuffle(on) => {
+                shuffle = on;
+                if on {
+                    // Keep the played history and the track you're hearing exactly where they are:
+                    // shuffling the past would rewrite what you just listened to, and shuffling the
+                    // present would skip the song mid-play. Only what's ahead is up for grabs.
+                    if order.is_empty() {
+                        order = queue.clone();
+                    }
+                    shuffle_after(&mut queue, qpos);
+                } else if !order.is_empty() {
+                    // Back to the list's own order, holding the current track under the playhead.
+                    // Radio's additions aren't in `order` — they were never in a list — so they keep
+                    // the order they arrived in, on the end.
+                    let current = queue.get(qpos).map(|t| t.uri.clone());
+                    let mut restored = order.clone();
+                    let known: std::collections::HashSet<&str> =
+                        order.iter().map(|t| t.uri.as_str()).collect();
+                    restored.extend(
+                        queue.iter().filter(|t| !known.contains(t.uri.as_str())).cloned(),
+                    );
+                    qpos = current
+                        .and_then(|u| restored.iter().position(|t| t.uri == u))
+                        .unwrap_or(0);
+                    queue = restored;
+                }
+                set(&state, &repaint, |s| {
+                    s.shuffle = on;
+                    s.queue = queue.clone();
+                    s.qpos = qpos;
+                    s.status = if on { "shuffle on".into() } else { "shuffle off".into() };
+                });
+                // Only if there IS a session — flipping a switch on an empty player must not
+                // overwrite the queue you left behind last time with nothing.
+                if !queue.is_empty() {
+                    save_session(&state, &queue, qpos);
+                }
+            }
+
+            Cmd::CycleRepeat => {
+                repeat = repeat.cycled();
+                set(&state, &repaint, |s| {
+                    s.repeat = repeat;
+                    s.status = match repeat {
+                        Repeat::Off => "repeat off".into(),
+                        Repeat::All => "repeat all".into(),
+                        Repeat::One => "repeat one".into(),
+                    };
+                });
+                // Only if there IS a session — flipping a switch on an empty player must not
+                // overwrite the queue you left behind last time with nothing.
+                if !queue.is_empty() {
+                    save_session(&state, &queue, qpos);
+                }
+            }
+
+            // Converted to `Next` (or handled) before the match — see the top of the loop.
+            Cmd::TrackEnded => {}
 
             Cmd::TrainTaste => {
                 let mut t = taste.lock().unwrap();
@@ -1300,24 +1458,11 @@ fn spawn_backfill(
 /// the ranking away. This samples without replacement with weight `1/(rank+2)`, so the best tracks
 /// are still the most likely to appear and the order changes every time you press play.
 fn sample(ranked: &[Track], count: usize) -> Vec<Track> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     if ranked.len() <= count {
         return ranked.to_vec();
     }
 
-    // Seed from the clock: a radio started twice in the same second may repeat; anything longer
-    // apart won't. No RNG dependency for a handful of draws.
-    let mut seed = {
-        let mut h = DefaultHasher::new();
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-            .hash(&mut h);
-        h.finish()
-    };
+    let mut seed = seed();
     let mut next = || {
         // xorshift64 — deterministic, fast, good enough to shuffle a playlist.
         seed ^= seed << 13;
@@ -1425,15 +1570,22 @@ pub struct Session {
     pub qpos: usize,
     pub position_ms: u32,
     pub view: String,
+    /// Defaulted, so a session written before these existed still loads.
+    #[serde(default)]
+    pub shuffle: bool,
+    #[serde(default)]
+    pub repeat: Repeat,
 }
 
 
 fn save_session(state: &Shared, queue: &[Track], qpos: usize) {
-    let (position_ms, view) = {
+    let (position_ms, view, shuffle, repeat) = {
         let s = state.lock().unwrap();
         (
             s.now.as_ref().map(|n| n.elapsed_ms()).unwrap_or(0),
             s.view.clone(),
+            s.shuffle,
+            s.repeat,
         )
     };
     cache::list_put(
@@ -1443,8 +1595,118 @@ fn save_session(state: &Shared, queue: &[Track], qpos: usize) {
             qpos,
             position_ms,
             view,
+            shuffle,
+            repeat,
         },
     );
+}
+
+/// Fisher–Yates over `queue[from..]`, leaving everything before `from` untouched.
+///
+/// Unbiased, unlike the sort-by-random-key trick: every remaining order is equally likely, which is
+/// the entire point of a shuffle button.
+fn shuffle_from(queue: &mut [Track], from: usize) {
+    if from >= queue.len() {
+        return;
+    }
+    let mut seed = seed();
+    let mut next = || {
+        // xorshift64 — the same generator `sample` uses. A shuffle needs a stream of numbers, not a
+        // source of entropy.
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for i in (from + 1..queue.len()).rev() {
+        let j = from + (next() % (i - from + 1) as u64) as usize;
+        queue.swap(i, j);
+    }
+}
+
+/// Shuffle only what comes AFTER the playing track — the played tracks and the one you're hearing
+/// stay put.
+fn shuffle_after(queue: &mut [Track], qpos: usize) {
+    shuffle_from(queue, qpos + 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the URI matters here — it's the identity the queue is keyed on.
+    fn tracks(n: usize) -> Vec<Track> {
+        (0..n)
+            .map(|i| {
+                let mut t: Track = serde_json::from_str(
+                    r#"{"uri":"","name":"","artists":"","album":"","duration_ms":0,"art_url":null}"#,
+                )
+                .unwrap();
+                t.uri = format!("spotify:track:{i}");
+                t
+            })
+            .collect()
+    }
+
+    fn uris(ts: &[Track]) -> Vec<&str> {
+        ts.iter().map(|t| t.uri.as_str()).collect()
+    }
+
+    /// The queue is the play order, so a shuffle that drops or duplicates a track silently deletes
+    /// music from someone's playlist. It must be a permutation, and the played tracks plus the one
+    /// under the playhead must not move.
+    #[test]
+    fn shuffle_permutes_the_tail_and_nothing_else() {
+        let original = tracks(50);
+        for qpos in [0, 1, 7, 48, 49] {
+            let mut q = original.clone();
+            shuffle_after(&mut q, qpos);
+
+            assert_eq!(q.len(), original.len());
+            assert_eq!(
+                uris(&q[..=qpos]),
+                uris(&original[..=qpos]),
+                "history/current moved"
+            );
+
+            let (mut got, mut want) = (uris(&q), uris(&original));
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "a track was lost or duplicated");
+        }
+    }
+
+    /// Every position must be reachable — a Fisher–Yates with the range off by one leaves the last
+    /// track pinned in place, which looks like a shuffle until you notice the album always ends the
+    /// same way.
+    #[test]
+    fn shuffle_can_move_every_track() {
+        let original = tracks(12);
+        let mut moved = vec![false; original.len()];
+        for _ in 0..200 {
+            let mut q = original.clone();
+            shuffle_from(&mut q, 0);
+            for (i, t) in q.iter().enumerate() {
+                if t.uri != original[i].uri {
+                    moved[i] = true;
+                }
+            }
+        }
+        assert!(moved.iter().all(|&m| m), "some position never changed: {moved:?}");
+    }
+}
+
+/// A seed off the wall clock. Two shuffles in the same nanosecond would match; nothing else does.
+fn seed() -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(1)
+        .hash(&mut h);
+    h.finish() | 1
 }
 
 /// Load queue[i] and reflect it in the UI immediately (don't wait for the player event).
@@ -1540,8 +1802,9 @@ fn spawn_event_pump(
                     PlayerEvent::EndOfTrack { .. } => {
                         n.position_ms = n.duration_ms;
                         n.since = None;
-                        // Roll on to the next queued track rather than going silent.
-                        let _ = tx.send(Cmd::Next);
+                        // Roll on rather than going silent — as a track *ending*, not as a skip, so
+                        // repeat-one can tell the two apart.
+                        let _ = tx.send(Cmd::TrackEnded);
                     }
                     _ => {}
                 }

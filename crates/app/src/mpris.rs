@@ -8,7 +8,7 @@
 //! rtray prefers a player that is actually *Playing* and isn't a browser, so an idle Nocturne won't
 //! steal the tray from something that's really making noise.
 
-use crate::backend::{Cmd, Shared};
+use crate::backend::{Cmd, Repeat, Shared};
 use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::{ObjectPath, Value};
@@ -185,6 +185,47 @@ impl Player {
     #[zbus(property)]
     fn rate(&self) -> f64 {
         1.0
+    }
+
+    /// Shuffle and LoopStatus are writable in the spec, so the shell can set them, not just show
+    /// them. Both go through the same commands the buttons do — the backend stays the one place
+    /// that knows how to reorder a queue.
+    #[zbus(property)]
+    fn shuffle(&self) -> bool {
+        self.state.lock().unwrap().shuffle
+    }
+
+    #[zbus(property)]
+    fn set_shuffle(&self, on: bool) {
+        let _ = self.tx.send(Cmd::SetShuffle(on));
+    }
+
+    #[zbus(property)]
+    fn loop_status(&self) -> String {
+        match self.state.lock().unwrap().repeat {
+            Repeat::Off => "None".into(),
+            Repeat::All => "Playlist".into(),
+            Repeat::One => "Track".into(),
+        }
+    }
+
+    /// The spec sets a value, but the backend only takes "cycle" — so cycle until it matches, at
+    /// most twice. Three states, one button, and no second way to set the mode to keep in step.
+    #[zbus(property)]
+    fn set_loop_status(&self, status: &str) {
+        let want = match status {
+            "Playlist" => Repeat::All,
+            "Track" => Repeat::One,
+            _ => Repeat::Off,
+        };
+        let mut have = self.state.lock().unwrap().repeat;
+        for _ in 0..2 {
+            if have == want {
+                return;
+            }
+            let _ = self.tx.send(Cmd::CycleRepeat);
+            have = have.cycled();
+        }
     }
 }
 
