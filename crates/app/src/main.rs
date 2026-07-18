@@ -6,7 +6,7 @@ mod icons;
 mod mpris;
 mod upscale;
 
-use backend::{Cmd, NowPlaying, Repeat, Shared};
+use backend::{Cmd, LockExt, NowPlaying, Repeat, Shared};
 use eframe::egui;
 use egui::{Align, Color32, Layout, Margin, RichText, Rounding, Stroke, Vec2};
 use livewall_uikit::{chrome, theme};
@@ -26,6 +26,23 @@ const NOWPANE_W: f32 = 320.0;
 const ROW_H: f32 = 56.0;
 const BAR_H: f32 = 96.0;
 const ART: f32 = 40.0;
+
+/// How many entries the decoded-texture caches ([`App::textures`], [`App::blurred`]) may hold.
+/// Big enough that a full screen of covers never churns; small enough that a long session doesn't
+/// accumulate a texture for every cover ever shown.
+const TEX_CACHE_CAP: usize = 200;
+
+/// Mark `url` as most-recently-used in a cache's recency queue.
+fn lru_touch(order: &mut std::collections::VecDeque<String>, url: &str) {
+    if order.back().is_some_and(|u| u == url) {
+        return;
+    }
+    if let Some(i) = order.iter().position(|u| u == url) {
+        if let Some(u) = order.remove(i) {
+            order.push_back(u);
+        }
+    }
+}
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -80,6 +97,10 @@ struct App {
     query: String,
     mood: String,
     textures: HashMap<String, egui::TextureHandle>,
+    /// Recency order of `textures` keys, least-recent first — the eviction queue that keeps the
+    /// texture cache (and its GPU memory) bounded. Touched on every hit so covers on screen this
+    /// frame are never the ones evicted.
+    textures_order: std::collections::VecDeque<String>,
     emoji: emoji::Emoji,
     loaded: bool,
     autologin_tried: bool,
@@ -92,6 +113,8 @@ struct App {
     /// Blurred backdrop textures, keyed by art url — built once, reused. The `f32` is the
     /// backdrop's mean luminance AFTER exposure, which decides how hard it gets scrimmed.
     blurred: HashMap<String, (egui::TextureHandle, f32)>,
+    /// Recency order of `blurred` keys — same bounding as `textures_order`.
+    blurred_order: std::collections::VecDeque<String>,
     /// The track whose "add to playlist" dialog is open, if any.
     add_to: Option<nocturne_api::Track>,
     /// ESRGAN-upscaled covers resident in VRAM, keyed by art url.
@@ -142,6 +165,7 @@ impl App {
             query: String::new(),
             mood: String::new(),
             textures: HashMap::new(),
+            textures_order: Default::default(),
             emoji: emoji::Emoji::new(),
             loaded: false,
             autologin_tried: false,
@@ -152,6 +176,7 @@ impl App {
             // Full screen IS the app. Browsing is a detour you take and come back from.
             vibe: true,
             blurred: HashMap::new(),
+            blurred_order: Default::default(),
             add_to: None,
             hires: HashMap::new(),
             hires_failed: Default::default(),
@@ -182,7 +207,7 @@ impl App {
         let Some(track) = self.add_to.clone() else {
             return;
         };
-        let playlists = self.state.lock().unwrap().playlists.clone();
+        let playlists = self.state.lock_ok().playlists.clone();
 
         let mut open = true;
         egui::Window::new("Add to playlist")
@@ -224,14 +249,24 @@ impl App {
     /// Decode art bytes into a texture once; later frames hit the cache.
     fn art(&mut self, ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
         if let Some(t) = self.textures.get(url) {
-            return Some(t.clone());
+            let t = t.clone();
+            lru_touch(&mut self.textures_order, url);
+            return Some(t);
         }
-        let bytes = self.state.lock().unwrap().art.get(url).cloned()?;
+        let bytes = self.state.lock_ok().art.get(url).cloned()?;
         let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
         let size = [img.width() as usize, img.height() as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
         let tex = ctx.load_texture(url, color, egui::TextureOptions::LINEAR);
         self.textures.insert(url.to_string(), tex.clone());
+        self.textures_order.push_back(url.to_string());
+        // Dropping the evicted handle frees its GPU texture. Least-recent goes first, and anything
+        // painted this frame was just touched — so nothing on screen is ever the one freed.
+        while self.textures_order.len() > TEX_CACHE_CAP {
+            if let Some(old) = self.textures_order.pop_front() {
+                self.textures.remove(&old);
+            }
+        }
         Some(tex)
     }
 
@@ -242,7 +277,7 @@ impl App {
     /// runs one pass at a time, and the cover on screen must never wait behind a cover for a track
     /// three skips ago.
     fn hires_window(&self) -> Vec<String> {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock_ok();
         let n = s.queue.len();
         if n == 0 {
             // Nothing queued (a bare resume, a single track): the only cover that matters is the
@@ -318,7 +353,7 @@ impl App {
         // 3. Ask the backend to resolve + stream source art for window tracks that don't have it.
         //    Queued-but-unplayed tracks usually have no big cover URL yet.
         let want: Vec<usize> = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock_ok();
             let n = s.queue.len();
             let cur = s.qpos.min(n.saturating_sub(1));
             (cur.saturating_sub(HIRES_BACK)..=(cur + HIRES_AHEAD).min(n.saturating_sub(1)))
@@ -332,7 +367,7 @@ impl App {
         };
         if !want.is_empty() {
             let uris: Vec<String> = {
-                let s = self.state.lock().unwrap();
+                let s = self.state.lock_ok();
                 want.iter()
                     .filter_map(|&i| s.queue.get(i).map(|t| t.uri.clone()))
                     .collect()
@@ -352,7 +387,7 @@ impl App {
                 // session's queue still carries 640px URLs whose bytes are already on disk, and
                 // upscaling one of those wastes a 12s pass on art we're about to replace.
                 let bytes = {
-                    let s = self.state.lock().unwrap();
+                    let s = self.state.lock_ok();
                     if !s.art_best.contains(url) {
                         continue;
                     }
@@ -369,9 +404,19 @@ impl App {
                 std::thread::spawn(move || {
                     // Decode off the UI thread and hand over the finished pixels: the 8000² PNG
                     // never crosses a thread boundary, and never lands in shared state.
-                    let image = upscale::upscale_image(&art_id, &bytes).map(|img| {
-                        let size = [img.width() as usize, img.height() as usize];
-                        egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())
+                    //
+                    // The send must happen even if the upscale panics — it is what clears
+                    // `hires_inflight`, and a stuck inflight entry blocks every future pass. So a
+                    // panic degrades to "this cover failed" rather than freezing the pipeline.
+                    let image = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        upscale::upscale_image(&art_id, &bytes).map(|img| {
+                            let size = [img.width() as usize, img.height() as usize];
+                            egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())
+                        })
+                    }))
+                    .unwrap_or_else(|_| {
+                        tracing::warn!("upscale worker panicked for {art_id}");
+                        None
                     });
                     let _ = tx.send((url, image));
                     ctx2.request_repaint();
@@ -394,7 +439,7 @@ impl App {
 
     /// Shuffle, as a switch. Sends the toggle; the backend owns the order.
     fn shuffle_button(&self, ui: &mut egui::Ui, size: f32) {
-        let on = self.state.lock().unwrap().shuffle;
+        let on = self.state.lock_ok().shuffle;
         let hint = if on {
             "Shuffle is on — click to play in list order (S)"
         } else {
@@ -407,7 +452,7 @@ impl App {
 
     /// Repeat, cycling off → all → one. One button, three states — the icon says which.
     fn repeat_button(&self, ui: &mut egui::Ui, size: f32) {
-        let mode = self.state.lock().unwrap().repeat;
+        let mode = self.state.lock_ok().repeat;
         let (icon, hint) = match mode {
             Repeat::Off => (Icon::Repeat, "Repeat off — click to repeat the queue (R)"),
             Repeat::All => (Icon::Repeat, "Repeating the queue — click to repeat this track (R)"),
@@ -487,7 +532,7 @@ impl eframe::App for App {
         self.hires_sync(ctx);
 
         let (logged_in, busy, status, now, view, current) = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock_ok();
             (
                 s.logged_in,
                 s.busy,
@@ -614,7 +659,7 @@ impl App {
                     .inner_margin(Margin::symmetric(10.0, 12.0)),
             )
             .show(ctx, |ui| {
-                let view = self.state.lock().unwrap().view.clone();
+                let view = self.state.lock_ok().view.clone();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("LIBRARY").weak().small());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -637,7 +682,7 @@ impl App {
                 }
                 // The current radio, as a first-class list. It lives on this disk and survives
                 // restarts; a new radio replaces it.
-                let radio = self.state.lock().unwrap().radio_playlist.clone();
+                let radio = self.state.lock_ok().radio_playlist.clone();
                 if let Some(pl) = radio {
                     ui.add_space(12.0);
                     ui.label(RichText::new("RADIO").weak().small());
@@ -654,7 +699,7 @@ impl App {
                 ui.label(RichText::new("PLAYLISTS").weak().small());
                 ui.add_space(6.0);
 
-                let playlists = self.state.lock().unwrap().playlists.clone();
+                let playlists = self.state.lock_ok().playlists.clone();
                 let mut clicked = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -747,7 +792,7 @@ impl App {
 
                 ui.add_space(16.0);
                 let (queue, qpos) = {
-                    let s = self.state.lock().unwrap();
+                    let s = self.state.lock_ok();
                     (s.queue.clone(), s.qpos)
                 };
 
@@ -850,7 +895,7 @@ impl App {
                         ui.add_space(8.0);
 
                         let (mut autoplay, radio_loading, analyzing, feats) = {
-                            let s = self.state.lock().unwrap();
+                            let s = self.state.lock_ok();
                             (s.autoplay, s.radio_loading, s.analyzing, s.taste_features)
                         };
                         if toggle(ui, &mut autoplay, "Radio").on_hover_text(format!(
@@ -903,7 +948,7 @@ impl App {
                 });
 
                 ui.add_space(14.0);
-                let tracks = self.state.lock().unwrap().tracks.clone();
+                let tracks = self.state.lock_ok().tracks.clone();
                 ui.horizontal(|ui| {
                     self.emoji.label(ui, &ctx2, view, 24.0, None, true);
                     ui.add_space(8.0);
@@ -926,7 +971,7 @@ impl App {
                         }
 
                         // Viewing the temp radio? Offer to make it permanent.
-                        let radio = self.state.lock().unwrap().radio_playlist.clone();
+                        let radio = self.state.lock_ok().radio_playlist.clone();
                         if let Some(pl) = radio {
                             if pl.name == view {
                                 ui.add_space(8.0);
@@ -952,7 +997,7 @@ impl App {
 
                 // --- rows ---
                 let (liked, playlists) = {
-                    let s = self.state.lock().unwrap();
+                    let s = self.state.lock_ok();
                     (s.liked.clone(), s.playlists.clone())
                 };
                 let mut play = None;
@@ -1100,7 +1145,7 @@ impl App {
                         );
                     });
                     let (liked, playlists, track) = {
-                        let s = self.state.lock().unwrap();
+                        let s = self.state.lock_ok();
                         (
                             s.current_uri.as_ref().is_some_and(|u| s.liked.contains(u)),
                             s.playlists.clone(),
@@ -1210,6 +1255,75 @@ impl App {
     }
 }
 
+/// Detect a solid matte border (a uniform frame — white label edges, letterboxing, a plain
+/// bottom strip) around a cover and return the inner rectangle `(x, y, w, h)` to keep, or `None`
+/// if there's no border worth trimming.
+///
+/// Each side is judged against *its own* edge colour, sampled at the middle of that edge — a
+/// one-sided white strip along the bottom has to match the bottom, not the muddy average of all
+/// four corners. A row/column counts as border while nearly all of its pixels sit within
+/// tolerance of that side's colour. Every side scans inward independently, capped at 30% so a
+/// busy edge can't eat the image, and the whole thing bails unless a real border was found.
+fn trim_matte(img: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
+    let (w, h) = img.dimensions();
+    if w < 16 || h < 16 {
+        return None;
+    }
+    let at = |x: u32, y: u32| img.get_pixel(x, y);
+    // ~14/channel of slack, summed across the three channels so a coloured matte trims as
+    // readily as white.
+    let close = |p: &image::Rgba<u8>, r: &image::Rgba<u8>| {
+        (0..3).map(|c| (p[c] as f32 - r[c] as f32).abs()).sum::<f32>() <= 42.0
+    };
+
+    let cap_x = w * 3 / 10;
+    let cap_y = h * 3 / 10;
+    // A line is border when at least 92% of its pixels match that side's sampled colour.
+    let top_c = *at(w / 2, 0);
+    let bot_c = *at(w / 2, h - 1);
+    let left_c = *at(0, h / 2);
+    let right_c = *at(w - 1, h / 2);
+    let row_border = |y: u32, r: &image::Rgba<u8>| {
+        (0..w).filter(|&x| close(at(x, y), r)).count() as u32 * 100 >= w * 92
+    };
+    let col_border = |x: u32, r: &image::Rgba<u8>| {
+        (0..h).filter(|&y| close(at(x, y), r)).count() as u32 * 100 >= h * 92
+    };
+
+    // Scan inward from an edge, tolerating a short run of non-matte lines — a title or logo
+    // printed on the frame (like "ANDY LEECH" across the bottom matte) shouldn't halt the trim
+    // before the real art begins. We keep going until either a sustained run of non-matte lines
+    // (the photo itself) or the cap, and trim to the deepest matte line we saw.
+    let scan = |cap: u32, is_border: &dyn Fn(u32) -> bool| -> u32 {
+        let tol = (cap / 3).max(3); // an interruption longer than this is content, not a logo
+        let (mut depth, mut gap, mut d) = (0u32, 0u32, 0u32);
+        while d < cap {
+            if is_border(d) {
+                depth = d + 1;
+                gap = 0;
+            } else {
+                gap += 1;
+                if gap > tol {
+                    break;
+                }
+            }
+            d += 1;
+        }
+        depth
+    };
+
+    let top = scan(cap_y, &|d| row_border(d, &top_c));
+    let bottom = scan(cap_y, &|d| row_border(h - 1 - d, &bot_c));
+    let left = scan(cap_x, &|d| col_border(d, &left_c));
+    let right = scan(cap_x, &|d| col_border(w - 1 - d, &right_c));
+
+    // A single stray matching edge line isn't a frame; require a few pixels of real border.
+    if top + bottom + left + right < 3 {
+        return None;
+    }
+    Some((left, top, w - left - right, h - top - bottom))
+}
+
 impl App {
     /// A big, soft, blurred version of the cover — the backdrop. Built once per cover.
     ///
@@ -1223,13 +1337,29 @@ impl App {
     /// scrim by what came out.
     fn backdrop(&mut self, ctx: &egui::Context, url: &str) -> Option<(egui::TextureHandle, f32)> {
         if let Some(t) = self.blurred.get(url) {
-            return Some(t.clone());
+            let t = t.clone();
+            lru_touch(&mut self.blurred_order, url);
+            return Some(t);
         }
-        let bytes = self.state.lock().unwrap().art.get(url).cloned()?;
+        let bytes = self.state.lock_ok().art.get(url).cloned()?;
         let img = image::load_from_memory(&bytes).ok()?;
+        // Some covers ship inside a solid matte frame — a white label border, letterboxing —
+        // and a 12px average would carry that frame's colour across the whole backdrop. Trim
+        // any near-uniform border first so the backdrop is built from the art, not the frame.
+        let full = img.to_rgba8();
+        let crop = trim_matte(&full);
+        let source = match crop {
+            Some((x, y, w, h)) => image::imageops::crop_imm(&full, x, y, w, h).to_image(),
+            None => full,
+        };
         // 12px, not 24: stretched across ~1300px that's a much softer blur, which is what stops
         // the backdrop competing with the cover in front of it.
-        let mut small = img.resize_exact(12, 12, image::imageops::FilterType::Triangle).to_rgba8();
+        let mut small = image::imageops::resize(
+            &source,
+            12,
+            12,
+            image::imageops::FilterType::Triangle,
+        );
 
         let lum = |p: &image::Rgba<u8>| {
             (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) / 255.0
@@ -1256,6 +1386,12 @@ impl App {
         let color = egui::ColorImage::from_rgba_unmultiplied([12, 12], small.as_raw());
         let tex = ctx.load_texture(format!("blur-{url}"), color, egui::TextureOptions::LINEAR);
         self.blurred.insert(url.to_string(), (tex.clone(), exposed));
+        self.blurred_order.push_back(url.to_string());
+        while self.blurred_order.len() > TEX_CACHE_CAP {
+            if let Some(old) = self.blurred_order.pop_front() {
+                self.blurred.remove(&old);
+            }
+        }
         Some((tex, exposed))
     }
 
@@ -1382,7 +1518,7 @@ impl App {
                 // deadlocks against itself — std::sync::Mutex is not reentrant. That froze the
                 // entire app (and MPRIS with it).
                 let (liked, playlists, track) = {
-                    let s = self.state.lock().unwrap();
+                    let s = self.state.lock_ok();
                     let uri = s.current_uri.clone();
                     (
                         uri.as_ref().is_some_and(|u| s.liked.contains(u)),
@@ -1502,7 +1638,7 @@ impl App {
                 // Straight to the list that is CURRENTLY PLAYING — not "Liked Songs", and not
                 // whatever you last browsed. Only shown when something is actually queued.
                 let playing_list = {
-                    let s = self.state.lock().unwrap();
+                    let s = self.state.lock_ok();
                     (!s.queue.is_empty()).then(|| s.queue_view.clone())
                 };
                 if let Some(name) = playing_list {
@@ -1527,7 +1663,7 @@ impl App {
                     self.send(Cmd::PlayPause);
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::S)) {
-                    let on = self.state.lock().unwrap().shuffle;
+                    let on = self.state.lock_ok().shuffle;
                     self.send(Cmd::SetShuffle(!on));
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::R)) {
