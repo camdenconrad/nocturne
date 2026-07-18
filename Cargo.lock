@@ -1985,7 +1985,6 @@ dependencies = [
 [[package]]
 name = "librespot-audio"
 version = "0.8.0"
-source = "git+https://github.com/librespot-org/librespot?branch=dev#db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195"
 dependencies = [
  "aes",
  "bytes",
@@ -2004,7 +2003,6 @@ dependencies = [
 [[package]]
 name = "librespot-connect"
 version = "0.8.0"
-source = "git+https://github.com/librespot-org/librespot?branch=dev#db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195"
 dependencies = [
  "futures-util",
  "librespot-core",
@@ -2023,7 +2021,6 @@ dependencies = [
 [[package]]
 name = "librespot-core"
 version = "0.8.0"
-source = "git+https://github.com/librespot-org/librespot?branch=dev#db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195"
 dependencies = [
  "aes",
  "base64",
@@ -2080,7 +2077,6 @@ dependencies = [
 [[package]]
 name = "librespot-discovery"
 version = "0.8.0"
-source = "git+https://github.com/librespot-org/librespot?branch=dev#db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195"
 dependencies = [
  "aes",
  "base64",
@@ -2107,7 +2103,6 @@ dependencies = [
 [[package]]
 name = "librespot-metadata"
 version = "0.8.0"
-source = "git+https://github.com/librespot-org/librespot?branch=dev#db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2124,7 +2119,6 @@ dependencies = [
 [[package]]
 name = "librespot-oauth"
 version = "0.8.0"
-source = "git+https://github.com/librespot-org/librespot?branch=dev#db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195"
 dependencies = [
  "log",
  "oauth2",
@@ -2137,7 +2131,6 @@ dependencies = [
 [[package]]
 name = "librespot-playback"
 version = "0.8.0"
-source = "git+https://github.com/librespot-org/librespot?branch=dev#db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195"
 dependencies = [
  "form_urlencoded",
  "futures-util",
@@ -2160,7 +2153,6 @@ dependencies = [
 [[package]]
 name = "librespot-protocol"
 version = "0.8.0"
-source = "git+https://github.com/librespot-org/librespot?branch=dev#db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195"
 dependencies = [
  "protobuf",
  "protobuf-codegen",

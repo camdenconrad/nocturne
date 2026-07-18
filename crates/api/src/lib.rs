@@ -219,7 +219,15 @@ impl Client {
             .await;
 
         for page in pages {
-            out.extend(page?);
+            match page {
+                Ok(items) => out.extend(items),
+                // Same rule as search: a later page failing must not throw away everything
+                // already fetched. Keep the partial library and say so.
+                Err(e) => {
+                    tracing::warn!("library page failed — keeping {} items fetched so far: {e}", out.len());
+                    break;
+                }
+            }
         }
         out.truncate(want);
         Ok(out)
@@ -312,8 +320,20 @@ impl Client {
 
     /// Raw image bytes for a cover URL (art lives on a CDN, not the API host).
     pub async fn fetch_art(&self, url: &str) -> Result<Vec<u8>, ApiError> {
+        // Covers are ~100 KB; cap the download so a hostile/broken URL can't balloon RAM.
+        const ART_MAX_BYTES: usize = 20 * 1024 * 1024;
         let resp = self.http.get(url).send().await?;
-        Ok(resp.bytes().await?.to_vec())
+        let mut out = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if out.len() + chunk.len() > ART_MAX_BYTES {
+                tracing::warn!("album art from {url} exceeds {ART_MAX_BYTES} bytes — truncating download");
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 }
 

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/api", "crates/session", "crates/sink", "crates/taste", "crates/app"]
+# vendor/librespot is its own workspace — keep it out of ours so its crates inherit their own
+# workspace.package fields.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,3 +26,17 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# vendor/librespot is the dev branch pinned at the Cargo.lock rev (db1ef7a) plus one patch:
+# playback/src/player.rs no longer exit(1)s when a sink stop/drain fails (which killed the whole
+# app whenever runic restarted under a live stream) — it marks the sink closed and plays on.
+# Every librespot crate must come from the same source or core's types would be duplicated.
+[patch."https://github.com/librespot-org/librespot"]
+librespot-core = { path = "vendor/librespot/core" }
+librespot-playback = { path = "vendor/librespot/playback" }
+librespot-connect = { path = "vendor/librespot/connect" }
+librespot-metadata = { path = "vendor/librespot/metadata" }
+librespot-discovery = { path = "vendor/librespot/discovery" }
+librespot-oauth = { path = "vendor/librespot/oauth" }
+librespot-protocol = { path = "vendor/librespot/protocol" }
+librespot-audio = { path = "vendor/librespot/audio" }

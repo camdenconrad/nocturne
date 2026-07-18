@@ -8,7 +8,7 @@
 //! rtray prefers a player that is actually *Playing* and isn't a browser, so an idle Nocturne won't
 //! steal the tray from something that's really making noise.
 
-use crate::backend::{Cmd, Repeat, Shared};
+use crate::backend::{Cmd, LockExt, Repeat, Shared};
 use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::{ObjectPath, Value};
@@ -69,7 +69,7 @@ impl Player {
     }
 
     fn play(&self) {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock_ok();
         if s.now.as_ref().is_some_and(|n| n.paused) {
             drop(s);
             let _ = self.tx.send(Cmd::PlayPause);
@@ -77,7 +77,7 @@ impl Player {
     }
 
     fn pause(&self) {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock_ok();
         if s.now.as_ref().is_some_and(|n| !n.paused) {
             drop(s);
             let _ = self.tx.send(Cmd::PlayPause);
@@ -98,7 +98,7 @@ impl Player {
 
     #[zbus(property)]
     fn playback_status(&self) -> String {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock_ok();
         match &s.now {
             Some(n) if !n.paused => "Playing".into(),
             Some(_) => "Paused".into(),
@@ -110,7 +110,7 @@ impl Player {
     /// `Vec::<String>::try_from(...)` on it, and a bare string silently yields no artist.
     #[zbus(property)]
     fn metadata(&self) -> HashMap<String, Value<'static>> {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock_ok();
         let mut md: HashMap<String, Value> = HashMap::new();
         let Some(n) = &s.now else {
             return md;
@@ -125,7 +125,14 @@ impl Player {
         let path = ObjectPath::try_from(format!("/com/coffee/nocturne{id}"))
             .unwrap_or_else(|_| ObjectPath::try_from("/com/coffee/nocturne/track").unwrap());
 
-        md.insert("mpris:trackid".into(), Value::from(path).try_to_owned().unwrap().into());
+        // `try_to_owned` failing just means no trackid this update — better a spec-incomplete
+        // metadata map than a dead D-Bus thread.
+        match Value::from(path).try_to_owned() {
+            Ok(v) => {
+                md.insert("mpris:trackid".into(), v.into());
+            }
+            Err(e) => tracing::warn!("mpris: could not own trackid value: {e}"),
+        }
         md.insert(
             "mpris:length".into(),
             Value::from(n.duration_ms as i64 * 1000),
@@ -173,13 +180,13 @@ impl Player {
 
     #[zbus(property)]
     fn position(&self) -> i64 {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock_ok();
         s.now.as_ref().map(|n| n.elapsed_ms() as i64 * 1000).unwrap_or(0)
     }
 
     #[zbus(property)]
     fn volume(&self) -> f64 {
-        self.state.lock().unwrap().volume as f64
+        self.state.lock_ok().volume as f64
     }
 
     #[zbus(property)]
@@ -192,7 +199,7 @@ impl Player {
     /// that knows how to reorder a queue.
     #[zbus(property)]
     fn shuffle(&self) -> bool {
-        self.state.lock().unwrap().shuffle
+        self.state.lock_ok().shuffle
     }
 
     #[zbus(property)]
@@ -202,7 +209,7 @@ impl Player {
 
     #[zbus(property)]
     fn loop_status(&self) -> String {
-        match self.state.lock().unwrap().repeat {
+        match self.state.lock_ok().repeat {
             Repeat::Off => "None".into(),
             Repeat::All => "Playlist".into(),
             Repeat::One => "Track".into(),
@@ -218,7 +225,7 @@ impl Player {
             "Track" => Repeat::One,
             _ => Repeat::Off,
         };
-        let mut have = self.state.lock().unwrap().repeat;
+        let mut have = self.state.lock_ok().repeat;
         for _ in 0..2 {
             if have == want {
                 return;
@@ -284,7 +291,7 @@ pub fn spawn(state: Shared, tx: UnboundedSender<Cmd>) {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
                 let now = {
-                    let s = state.lock().unwrap();
+                    let s = state.lock_ok();
                     s.now.as_ref().map(|n| (n.name.clone(), n.paused))
                 };
                 if now != last {

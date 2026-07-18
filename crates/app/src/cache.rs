@@ -99,10 +99,20 @@ pub async fn art_fetch(url: &str) -> Option<Vec<u8>> {
         if !resp.status().is_success() {
             return None;
         }
+        // Even the label masters are a few MB; cap the download so a broken/hostile response
+        // can't fill the disk.
+        const ART_MAX_BYTES: u64 = 20 * 1024 * 1024;
         let mut file = std::fs::File::create(&tmp).ok()?;
         let mut stream = resp.bytes_stream();
+        let mut written: u64 = 0;
         while let Some(chunk) = stream.next().await {
-            file.write_all(&chunk.ok()?).ok()?;
+            let chunk = chunk.ok()?;
+            written += chunk.len() as u64;
+            if written > ART_MAX_BYTES {
+                tracing::warn!("cover from {url} exceeds {ART_MAX_BYTES} bytes — abandoning download");
+                return None;
+            }
+            file.write_all(&chunk).ok()?;
         }
         file.flush().ok()?;
         Some(())

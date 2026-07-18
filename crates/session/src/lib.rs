@@ -163,11 +163,16 @@ fn save_token(tok: &librespot_oauth::OAuthToken) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let Ok(bytes) = serde_json::to_vec(&stored) else {
-        return;
+    let bytes = match serde_json::to_vec(&stored) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("could not serialize oauth token — next launch will re-auth: {e}");
+            return;
+        }
     };
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, bytes).is_err() {
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        tracing::warn!("could not write {} — next launch will re-auth: {e}", tmp.display());
         return;
     }
     #[cfg(unix)]
@@ -175,7 +180,9 @@ fn save_token(tok: &librespot_oauth::OAuthToken) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    let _ = std::fs::rename(&tmp, &path);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        tracing::warn!("could not persist oauth token to {} — next launch will re-auth: {e}", path.display());
+    }
 }
 
 /// Get a usable token with the *least* privilege escalation possible, in order:
@@ -221,7 +228,11 @@ fn dirs_cache() -> std::path::PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var("HOME").expect("HOME unset")).join(".cache")
+            let home = std::env::var("HOME").unwrap_or_else(|_| {
+                tracing::warn!("HOME unset — caching under the current directory");
+                ".".into()
+            });
+            std::path::PathBuf::from(home).join(".cache")
         })
 }
 
