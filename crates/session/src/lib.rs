@@ -139,7 +139,9 @@ fn now_unix() -> u64 {
 /// True when a previous consent is on disk, so login will be silent (no browser). The UI uses this
 /// to sign in on startup instead of making the user click a button that never asks them anything.
 pub fn has_cached_login() -> bool {
-    load_token().is_some()
+    // The session connects with librespot's cached credential, so that file — not oauth.json — is
+    // what decides whether sign-in will be silent. Either one is enough to try without a browser.
+    dirs_cache().join("nocturne").join("credentials.json").exists() || load_token().is_some()
 }
 
 fn load_token() -> Option<StoredToken> {
@@ -250,7 +252,11 @@ pub struct NocturneHandle {
     player: std::sync::Arc<Player>,
     mixer: std::sync::Arc<SoftMixer>,
     /// Our own OAuth token — see [`NocturneHandle::web_token`] for why librespot's isn't used.
-    oauth: std::sync::Arc<tokio::sync::Mutex<librespot_oauth::OAuthToken>>,
+    ///
+    /// `None` until the first Web API call needs it. Playback rides on the cached session
+    /// credential, so a launch that never touches the Web API never spends a refresh — and a
+    /// refresh token that has gone bad degrades the Web API instead of blocking sign-in.
+    oauth: std::sync::Arc<tokio::sync::Mutex<Option<librespot_oauth::OAuthToken>>>,
 }
 
 impl NocturneHandle {
@@ -277,19 +283,31 @@ impl NocturneHandle {
         )
         .map_err(|e| SessionError::Connect(e.to_string()))?;
 
-        // librespot-oauth is blocking and spins up its own runtime internally; calling it straight
-        // from async panics on drop ("cannot drop a runtime in a context where blocking is not
-        // allowed"). It has to run on a blocking thread.
-        let token = tokio::task::spawn_blocking(obtain_token)
-            .await
-            .map_err(|e| SessionError::OAuth(e.to_string()))??;
-        let credentials = Credentials::with_access_token(token.access_token.clone());
-
-        let session = Session::new(SessionConfig::default(), Some(cache));
-        session
-            .connect(credentials, true)
-            .await
-            .map_err(|e| SessionError::Connect(e.to_string()))?;
+        // Prefer the reusable credential librespot cached the first time we logged in. It's a
+        // long-lived stored-credential blob, not a wrapped access token, so it reconnects on its
+        // own — and crucially it costs no OAuth.
+        //
+        // Minting session credentials from an OAuth access token on every launch was the bug
+        // behind "it keeps making me sign in again": the access token lives ~1h, so nearly every
+        // launch took the *refresh* branch, and Spotify rotates the refresh token on use. Any
+        // hiccup around that rotation — a crash before the new token is persisted, or two copies
+        // of the app refreshing the same token concurrently — leaves a dead refresh token on
+        // disk, and the launch after that falls through to the browser.
+        //
+        // So the session and the Web API no longer share a credential path: the session rides on
+        // the cached blob, and OAuth is spent only for Web API calls (see `web_token`), lazily.
+        let session = Session::new(SessionConfig::default(), Some(cache.clone()));
+        match cache.credentials() {
+            Some(stored) => {
+                tracing::info!("connecting with the cached credential (no OAuth spent)");
+                // `false`: it came from the cache, so re-storing it is a pointless rewrite.
+                if let Err(e) = session.connect(stored, false).await {
+                    tracing::warn!("cached credential rejected ({e}) — falling back to OAuth");
+                    Self::connect_via_oauth(&session).await?;
+                }
+            }
+            None => Self::connect_via_oauth(&session).await?,
+        }
 
         let mixer = std::sync::Arc::new(
             SoftMixer::open(MixerConfig::default())
@@ -311,8 +329,24 @@ impl NocturneHandle {
             session,
             player,
             mixer,
-            oauth: std::sync::Arc::new(tokio::sync::Mutex::new(token)),
+            oauth: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    /// The cold-start path: no cached credential, so run the OAuth flow and authenticate with the
+    /// resulting access token. `true` stores the reusable credential Spotify hands back, which is
+    /// what every later launch connects with instead.
+    async fn connect_via_oauth(session: &Session) -> Result<(), SessionError> {
+        // librespot-oauth is blocking and spins up its own runtime internally; calling it straight
+        // from async panics on drop ("cannot drop a runtime in a context where blocking is not
+        // allowed"). It has to run on a blocking thread.
+        let token = tokio::task::spawn_blocking(obtain_token)
+            .await
+            .map_err(|e| SessionError::OAuth(e.to_string()))??;
+        session
+            .connect(Credentials::with_access_token(token.access_token), true)
+            .await
+            .map_err(|e| SessionError::Connect(e.to_string()))
     }
 
     pub fn play(&self, track: SpotifyId) {
@@ -560,8 +594,21 @@ impl NocturneHandle {
     /// NOT `session.token_provider()` — that mints tokens against *librespot's* built-in client id,
     /// which Spotify 403s ("Invalid request") for Web API scopes. We already hold a PKCE token
     /// issued to *our* app with the scopes we asked for, so reuse it and refresh when it ages out.
+    /// Obtained on first use rather than at login, so playback never waits on — or is blocked by —
+    /// the OAuth path. The lock is held across the refresh so two concurrent Web API calls can't
+    /// both spend the same rotating refresh token.
     pub async fn web_token(&self) -> Result<String, SessionError> {
-        let mut tok = self.oauth.lock().await;
+        let mut slot = self.oauth.lock().await;
+
+        let Some(tok) = slot.as_mut() else {
+            let fresh = tokio::task::spawn_blocking(obtain_token)
+                .await
+                .map_err(|e| SessionError::OAuth(e.to_string()))??;
+            let access = fresh.access_token.clone();
+            *slot = Some(fresh);
+            return Ok(access);
+        };
+
         // Refresh a minute early rather than racing the expiry mid-request.
         if tok.expires_at <= std::time::Instant::now() + std::time::Duration::from_secs(60) {
             tracing::info!("web token expired — refreshing");
@@ -574,6 +621,8 @@ impl NocturneHandle {
             })
             .await
             .map_err(|e| SessionError::OAuth(e.to_string()))??;
+            // Persist the rotated refresh token *before* it's used for anything else — losing this
+            // write is precisely what strands the next launch at the browser.
             save_token(&fresh);
             *tok = fresh;
         }

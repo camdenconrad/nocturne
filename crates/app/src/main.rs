@@ -103,7 +103,11 @@ struct App {
     textures_order: std::collections::VecDeque<String>,
     emoji: emoji::Emoji,
     loaded: bool,
-    autologin_tried: bool,
+    /// When the next silent-login attempt is allowed, and how many we've made. A single failure
+    /// used to latch the sign-in screen for the whole process — a transient network blip at
+    /// startup meant clicking through a browser flow that wasn't actually needed.
+    autologin_at: Option<std::time::Instant>,
+    autologin_attempts: u32,
     /// Local volume while dragging, so the slider doesn't fight the backend each frame.
     volume: f32,
     show_sidebar: bool,
@@ -168,7 +172,8 @@ impl App {
             textures_order: Default::default(),
             emoji: emoji::Emoji::new(),
             loaded: false,
-            autologin_tried: false,
+            autologin_at: Some(std::time::Instant::now()),
+            autologin_attempts: 0,
             volume: 1.0,
             // Tucked away: full screen is home, and the library is something you pull out.
             show_sidebar: false,
@@ -570,10 +575,24 @@ impl eframe::App for App {
             self.unfullscreened = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
-        if !logged_in && !self.autologin_tried {
-            self.autologin_tried = true;
-            if nocturne_session::has_cached_login() {
-                self.send(Cmd::Login);
+        // Retry silent login a few times with backoff before falling back to the sign-in screen.
+        // Capped at 4 tries so a genuinely dead credential still surfaces the button promptly
+        // instead of retrying forever behind a spinner.
+        const AUTOLOGIN_TRIES: u32 = 4;
+        if !logged_in && !busy && self.autologin_attempts < AUTOLOGIN_TRIES {
+            if self.autologin_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                if nocturne_session::has_cached_login() {
+                    self.autologin_attempts += 1;
+                    let backoff = 2u64.pow(self.autologin_attempts); // 2s, 4s, 8s, 16s
+                    self.autologin_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff));
+                    ctx.request_repaint_after(std::time::Duration::from_secs(backoff));
+                    self.send(Cmd::Login);
+                } else {
+                    self.autologin_attempts = AUTOLOGIN_TRIES; // cold start — go straight to the button
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
             }
         }
         if logged_in && !self.loaded {
