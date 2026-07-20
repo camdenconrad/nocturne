@@ -134,6 +134,10 @@ pub struct State {
     pub taste_trained: usize,
     /// Tracks with Spotify's real analysis attached.
     pub taste_features: usize,
+    /// Share of Claude's named tracks that matched a real one on the last search. `None` when
+    /// Claude wasn't consulted. Worth surfacing: a rate that collapses means the model is naming
+    /// music that doesn't exist, which no amount of ranking can fix.
+    pub taste_resolve_rate: Option<f32>,
     /// True while the background analysis backfill is still running.
     pub analyzing: bool,
     /// The live queue and where we are in it — drives Up Next / History panels.
@@ -187,6 +191,7 @@ impl Default for State {
             radio_loading: false,
             taste_trained: 0,
             taste_features: 0,
+            taste_resolve_rate: None,
             analyzing: false,
             queue: Vec::new(),
             qpos: 0,
@@ -377,14 +382,43 @@ async fn run(
                 // 2000-track Liked Songs sweep at startup) blocks every later click behind it —
                 // which is exactly why opening a playlist "took forever".
                 let (h, st, rp) = (handle.clone(), state.clone(), repaint.clone());
+                let ta = taste.clone();
                 tokio::spawn(async move {
                     if let Some(api) = api(&h, &st, &rp).await {
-                        busy(&st, &rp, format!("searching “{q}”…"));
+                        // Say which kind of search is running: the Claude pass takes seconds, and
+                        // an unexplained pause reads as a hang.
+                        let asking = nocturne_taste::llm::available();
+                        busy(
+                            &st,
+                            &rp,
+                            if asking {
+                                format!("finding tracks for “{q}”…")
+                            } else {
+                                format!("searching “{q}”…")
+                            },
+                        );
                         set(&st, &rp, |s| s.view = format!("Search: {q}"));
-                        match api.search_tracks(&q, 50).await {
-                            Ok(t) => finish_tracks(&st, &rp, t).await,
-                            Err(e) => fail(&st, &rp, format!("search: {e}")),
+
+                        // Claude names tracks, Spotify confirms they exist, and whatever survives
+                        // is merged with plain keyword hits. With no API key — or on any Claude
+                        // failure — this is exactly the keyword search it always was.
+                        let pool = nocturne_taste::find::pool(&api, &q, 50).await;
+
+                        if pool.tracks.is_empty() {
+                            fail(&st, &rp, format!("nothing found for “{q}”"));
+                            return;
                         }
+                        if let Some(rate) = pool.resolve_rate() {
+                            set(&st, &rp, |s| {
+                                s.taste_resolve_rate = Some(rate);
+                            });
+                        }
+
+                        // Claude proposed; the learned model orders. What Camden actually plays is
+                        // better evidence than what a model thinks the words imply — and `rank` is
+                        // sync, so it runs once every await is done rather than across one.
+                        let ranked = ta.lock_ok().rank(pool.tracks);
+                        finish_tracks(&st, &rp, ranked).await;
                     }
                 });
             }
