@@ -51,13 +51,15 @@ struct Target {
     tempo: f32,
 }
 
+/// True when *any* credential resolves — an API key, Claude Code's sign-in, or `ant`. See
+/// [`crate::auth`]: an unset ANTHROPIC_API_KEY does not mean there's nothing to authenticate with.
 pub fn available() -> bool {
-    std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+    crate::auth::available()
 }
 
 /// Ask Haiku for the mood. `None` on any problem at all — the caller then uses the word list.
 pub async fn parse_mood(phrase: &str) -> Option<Mood> {
-    let key = std::env::var("ANTHROPIC_API_KEY").ok()?;
+    let cred = crate::auth::credential()?;
     let body = serde_json::json!({
         "model": MOOD_MODEL,
         "max_tokens": 200,
@@ -66,9 +68,7 @@ pub async fn parse_mood(phrase: &str) -> Option<Mood> {
     });
 
     let http = reqwest::Client::new();
-    let resp = http
-        .post(ENDPOINT)
-        .header("x-api-key", key)
+    let resp = crate::auth::authorize(http.post(ENDPOINT), &cred)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         // A radio must not hang on a mood. If Haiku is slow, the word list answers instead.
@@ -177,7 +177,7 @@ pub async fn continue_station(recent: &[(String, String)], want: usize) -> Vec<S
 /// each one against Spotify and discards what doesn't resolve. Returns an empty vec on any
 /// problem, so the caller falls back to plain search rather than failing the query.
 pub async fn suggest_tracks(query: &str, want: usize) -> Vec<Suggestion> {
-    let Ok(key) = std::env::var("ANTHROPIC_API_KEY") else {
+    let Some(cred) = crate::auth::credential() else {
         return Vec::new();
     };
 
@@ -222,9 +222,7 @@ pub async fn suggest_tracks(query: &str, want: usize) -> Vec<Suggestion> {
     });
 
     let http = reqwest::Client::new();
-    let resp = match http
-        .post(ENDPOINT)
-        .header("x-api-key", key)
+    let resp = match crate::auth::authorize(http.post(ENDPOINT), &cred)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         // Longer than the mood call: this one thinks, and it's the user's actual query rather

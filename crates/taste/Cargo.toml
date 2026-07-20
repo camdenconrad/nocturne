@@ -16,3 +16,8 @@ serde_json = "1"
 futures-util = "0.3"
 tracing.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+
+# For examples only — the library itself stays runtime-agnostic.
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

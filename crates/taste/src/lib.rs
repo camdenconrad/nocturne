@@ -17,6 +17,7 @@
 //! carry the similarity. A track with no analysis — local files, some new releases — still embeds,
 //! just with the feature block zeroed and identity doing the work.
 
+pub mod auth;
 pub mod find;
 pub mod llm;
 pub mod mood;
