@@ -145,6 +145,32 @@ Give the primary artist only, without featured credits, and the track title with
 parenthetical suffix. Spread across artists: at most two tracks by any one of them. \
 Honour every constraint in the request — era, language, genre, energy, setting.";
 
+/// Ask Claude to continue a listening session.
+///
+/// Same machinery as [`suggest_tracks`], but the prompt is the recent queue rather than a typed
+/// request — the station's "query" is what's already playing. Asks for a whole batch at once so a
+/// refill costs one call per ~20 tracks instead of one per track.
+pub async fn continue_station(recent: &[(String, String)], want: usize) -> Vec<Suggestion> {
+    if recent.is_empty() {
+        return Vec::new();
+    }
+    let played = recent
+        .iter()
+        .map(|(artist, title)| format!("- {artist} — {title}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    suggest_tracks(
+        &format!(
+            "These just played, most recent last:\n{played}\n\n\
+             Continue this listening session. Stay in its world — era, mood, production, energy — \
+             without repeating any track above or leaning on the same few artists. Move somewhere \
+             a thoughtful DJ would go next rather than naming the most obvious neighbours."
+        ),
+        want,
+    )
+    .await
+}
+
 /// Ask Claude to name tracks fitting a free-text request.
 ///
 /// These are *names*, not catalogue entries: nothing here is playable until the caller matches

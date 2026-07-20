@@ -12,6 +12,7 @@ fn t(name: &str, artist: &str, album: &str) -> Track {
         album: album.into(),
         duration_ms: 200_000,
         art_url: None,
+        art_big: None,
         popularity: Some(50),
         explicit: Some(false),
     }

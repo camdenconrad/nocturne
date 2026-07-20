@@ -904,6 +904,28 @@ impl App {
                         self.send(Cmd::Search(self.query.clone()));
                     }
 
+                    // Keep a result set. Only offered while looking at one — the button is
+                    // meaningless on Liked Songs, which is already a list Spotify holds.
+                    let saveable = {
+                        let s = self.state.lock_ok();
+                        view.starts_with("Search: ") && !s.tracks.is_empty()
+                    };
+                    if saveable
+                        && ui
+                            .button("Save as playlist")
+                            .on_hover_text("Create a Spotify playlist from these results")
+                            .clicked()
+                    {
+                        let (name, tracks) = {
+                            let s = self.state.lock_ok();
+                            (
+                                view.trim_start_matches("Search: ").to_string(),
+                                s.tracks.clone(),
+                            )
+                        };
+                        self.send(Cmd::SaveTracksToSpotify(name, tracks));
+                    }
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icons::button(ui, Icon::Radio, 30.0, true)
                             .on_hover_text("Show/hide up-next")

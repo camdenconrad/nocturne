@@ -50,6 +50,12 @@ pub enum Cmd {
     ShowRadioPlaylist,
     /// Persist the temp radio playlist to Spotify as a real playlist.
     SaveRadioToSpotify,
+    /// Persist an arbitrary track list — a search result, typically — as a real Spotify playlist.
+    SaveTracksToSpotify(String, Vec<Track>),
+    /// Top the station up in the background, before the queue runs dry.
+    PrefetchStation,
+    /// Append prefetched tracks to the live queue.
+    ExtendQueue(Vec<Track>),
     /// Add a track to a playlist. Local: Spotify 403s playlist writes for restricted apps too.
     AddToPlaylist(String, Track),
     /// Shuffle the queue, or put it back in its original order.
@@ -308,6 +314,12 @@ async fn run(
     // player with nothing in it.
     let mut resume_at: u32 = 0;
     let mut needs_load = false;
+    /// Refill the station once the queue gets this short, rather than waiting for it to run dry —
+    /// the Claude round trip takes seconds, and the gap between tracks is not seconds.
+    const STATION_LOW_WATER: usize = 5;
+    /// One refill in flight at a time. Without this, every `Next` inside the low-water window
+    /// fires another batch.
+    let mut prefetching = false;
     // Likes = Spotify's Liked Songs (seeded when the list loads) PLUS local additions, MINUS local
     // removals. Two overlay sets, because Spotify won't take the write and we still have to
     // represent "he un-liked a track that Spotify thinks he likes".
@@ -634,6 +646,18 @@ async fn run(
                             run.push((t.clone(), 0.0));
                         }
                         start(&state, &repaint, h, &queue, qpos);
+                        // Top up before the queue runs out, so the refill's round trip happens
+                        // while there's still music playing over it.
+                        let left = queue.len() - (qpos + 1);
+                        if left <= STATION_LOW_WATER
+                            && !prefetching
+                            && repeat != Repeat::All
+                            && state.lock_ok().autoplay
+                            && nocturne_taste::llm::available()
+                        {
+                            prefetching = true;
+                            let _ = self_tx.send(Cmd::PrefetchStation);
+                        }
                     } else if repeat == Repeat::All && !queue.is_empty() {
                         // Wrap. An explicit "repeat everything" outranks radio's guess at what to
                         // play next — and a shuffled second lap gets a NEW order, or it isn't one.
@@ -1128,6 +1152,88 @@ async fn run(
                         }
                     }
                 });
+            }
+
+            Cmd::SaveTracksToSpotify(name, tracks) => {
+                if tracks.is_empty() {
+                    set(&state, &repaint, |s| {
+                        s.status = "nothing to save".into();
+                    });
+                    continue;
+                }
+                let (h, st, rp) = (handle.clone(), state.clone(), repaint.clone());
+                tokio::spawn(async move {
+                    let Some(api) = api(&h, &st, &rp).await else { return };
+                    busy(&st, &rp, format!("saving “{name}” to Spotify…"));
+                    let uris: Vec<String> = tracks.iter().map(|t| t.uri.clone()).collect();
+                    match api.create_playlist(&name, &uris).await {
+                        Ok(id) => {
+                            tracing::info!("saved “{name}” to Spotify as {id}");
+                            set(&st, &rp, |s| {
+                                s.busy = false;
+                                s.status = format!("“{name}” saved to Spotify");
+                            });
+                            // It's a real playlist now — pull the list again so it appears.
+                            let _ = api.playlists(500).await.map(|p| {
+                                cache::list_put("playlists", &p);
+                                set(&st, &rp, |s| s.playlists = p);
+                            });
+                        }
+                        // Same restriction the radio save hits: Spotify 403s playlist writes for
+                        // restricted apps. Say so plainly instead of a bare error code.
+                        Err(e) => fail(&st, &rp, format!("Spotify refused the playlist ({e})")),
+                    }
+                });
+            }
+
+            Cmd::PrefetchStation => {
+                // Ask Claude to continue the session from what just played. Resolution happens off
+                // the command loop; the batch comes back as ExtendQueue.
+                let recent: Vec<(String, String)> = queue
+                    .iter()
+                    .rev()
+                    .take(10)
+                    .rev()
+                    .map(|t| (t.artists.clone(), t.name.clone()))
+                    .collect();
+                let exclude: std::collections::HashSet<String> =
+                    queue.iter().map(|t| t.uri.clone()).collect();
+                let (h, st, rp, tx) =
+                    (handle.clone(), state.clone(), repaint.clone(), self_tx.clone());
+                tokio::spawn(async move {
+                    let more = match api(&h, &st, &rp).await {
+                        Some(api) => {
+                            nocturne_taste::find::station(&api, &recent, &exclude, 20).await
+                        }
+                        None => Vec::new(),
+                    };
+                    // Always answer, even with nothing — the reply is what clears `prefetching`,
+                    // and a dropped one would wedge the station for the rest of the session.
+                    let _ = tx.send(Cmd::ExtendQueue(more));
+                });
+            }
+
+            Cmd::ExtendQueue(more) => {
+                prefetching = false;
+                if more.is_empty() {
+                    // Not an error: no key, no resolutions, or Claude was down. The dry-queue path
+                    // below still falls back to Spotify's radio when the queue actually empties.
+                    continue;
+                }
+                // Claude proposed, the learned model orders — same contract as search.
+                let more = taste.lock_ok().rank(more);
+                tracing::info!("station: prefetched {} tracks", more.len());
+                // These are OUR picks — finishing or liking one grades the model.
+                ours.extend(more.iter().map(|t| t.uri.clone()));
+                set(&state, &repaint, |s| {
+                    s.status = format!("station: +{} queued", more.len());
+                });
+                queue.extend(more);
+                set(&state, &repaint, |s| {
+                    s.queue = queue.clone();
+                    s.qpos = qpos;
+                });
+                save_session(&state, &queue, qpos);
             }
 
             Cmd::AddToPlaylist(id, track) => {

@@ -49,32 +49,90 @@ async fn resolve(api: &Client, s: &Suggestion) -> Option<Track> {
     let query = format!("track:{} artist:{}", s.title, s.artist);
     let hits = api.search_tracks(&query, 5).await.ok()?;
 
-    hits.into_iter().find(|t| {
-        let artist_ok = norm(&t.artists).contains(&norm(&s.artist))
-            || norm(&s.artist).contains(&norm(&t.artists));
-        // The title check is prefix-based on purpose: Spotify titles carry suffixes the model
-        // won't have predicted — "(Remastered 2011)", "- Live at Wembley".
-        let title_ok = norm(&t.name).starts_with(&norm(&s.title))
-            || norm(&s.title).starts_with(&norm(&t.name));
-        artist_ok && title_ok
-    })
+    hits.into_iter()
+        .find(|t| is_match(&t.artists, &t.name, &s.artist, &s.title))
+}
+
+/// Does a catalogue hit actually correspond to what was asked for?
+///
+/// Artist is a containment check because Spotify joins collaborators into one field ("Sonic Youth,
+/// Kim Gordon") while the model names one. Title is prefix-based because Spotify titles carry
+/// suffixes the model won't have predicted — "(Remastered 2011)", "- Live at Wembley" — but a
+/// prefix in *either* direction, so an abbreviated guess still matches its fuller real title.
+fn is_match(track_artists: &str, track_name: &str, want_artist: &str, want_title: &str) -> bool {
+    let (ta, tn) = (norm(track_artists), norm(track_name));
+    let (wa, wt) = (norm(want_artist), norm(want_title));
+    if ta.is_empty() || tn.is_empty() || wa.is_empty() || wt.is_empty() {
+        return false;
+    }
+    let artist_ok = ta.contains(&wa) || wa.contains(&ta);
+    let title_ok = tn.starts_with(&wt) || wt.starts_with(&tn);
+    artist_ok && title_ok
 }
 
 /// Lowercase, strip punctuation and collapse whitespace, so "Don't Look Back" and "dont look back"
 /// compare equal.
+///
+/// Apostrophes are *deleted* rather than treated as separators — "Don't" has to normalise to
+/// "dont", not "don t", or every contraction fails to match. Everything else non-alphanumeric
+/// becomes a space, because a comma genuinely does separate two artists.
 fn norm(s: &str) -> String {
+    const ELIDED: [char; 4] = ['\'', '\u{2019}', '`', '\u{00B4}'];
     let mut out = String::with_capacity(s.len());
     let mut space = false;
     for c in s.chars() {
         if c.is_alphanumeric() {
             space = false;
             out.extend(c.to_lowercase());
+        } else if ELIDED.contains(&c) {
+            // Skip entirely — no separator.
         } else if !out.is_empty() && !space {
             space = true;
             out.push(' ');
         }
     }
     out.trim_end().to_string()
+}
+
+/// Resolve a batch of suggestions into real tracks, dropping whatever doesn't exist.
+async fn resolve_all(api: &Client, suggestions: Vec<Suggestion>) -> Vec<Track> {
+    futures_util::stream::iter(suggestions)
+        .map(|s| async move { resolve(api, &s).await })
+        .buffered(RESOLVE_CONCURRENCY)
+        .filter_map(|hit| async move { hit })
+        .collect()
+        .await
+}
+
+/// Extend a station from what just played.
+///
+/// Returns empty when Claude is unavailable or nothing resolves — the caller then falls back to
+/// Spotify's own radio, so autoplay never stalls on this. `exclude` is the URIs already in the
+/// queue, so a refill can't hand back something queued or just heard.
+pub async fn station(
+    api: &Client,
+    recent: &[(String, String)],
+    exclude: &HashSet<String>,
+    want: usize,
+) -> Vec<Track> {
+    if !llm::available() {
+        return Vec::new();
+    }
+    let suggestions = llm::continue_station(recent, want).await;
+    let suggested = suggestions.len();
+    if suggested == 0 {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let tracks: Vec<Track> = resolve_all(api, suggestions)
+        .await
+        .into_iter()
+        .filter(|t| !exclude.contains(&t.uri) && seen.insert(t.uri.clone()))
+        .collect();
+
+    tracing::info!("claude radio: {}/{suggested} resolved and new", tracks.len());
+    tracks
 }
 
 /// Build the candidate pool for a request.
@@ -90,13 +148,7 @@ pub async fn pool(api: &Client, query: &str, want: usize) -> Pool {
     };
     let suggested = suggestions.len();
 
-    // Resolve concurrently, but bounded — see RESOLVE_CONCURRENCY.
-    let picked: Vec<Track> = futures_util::stream::iter(suggestions)
-        .map(|s| async move { resolve(api, &s).await })
-        .buffered(RESOLVE_CONCURRENCY)
-        .filter_map(|hit| async move { hit })
-        .collect()
-        .await;
+    let picked = resolve_all(api, suggestions).await;
     let resolved = picked.len();
 
     if suggested > 0 {
@@ -123,4 +175,56 @@ pub async fn pool(api: &Client, query: &str, want: usize) -> Pool {
         .collect();
 
     Pool { tracks, suggested, resolved }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalises_punctuation_and_case() {
+        assert_eq!(norm("Don't Look Back"), "dont look back");
+        assert_eq!(norm("  Spaced   Out!  "), "spaced out");
+        assert_eq!(norm("Sigur Rós"), "sigur rós");
+        // Curly apostrophes too — Spotify uses them, models tend to type straight ones.
+        assert_eq!(norm("Don\u{2019}t Look Back"), "dont look back");
+        // A comma really does separate two artists, so it must stay a boundary.
+        assert_eq!(norm("Sonic Youth, Kim Gordon"), "sonic youth kim gordon");
+    }
+
+    #[test]
+    fn accepts_a_real_hit() {
+        assert!(is_match("Slowdive", "Alison", "Slowdive", "Alison"));
+        assert!(is_match("slowdive", "ALISON", "Slowdive", "alison"));
+    }
+
+    #[test]
+    fn tolerates_spotify_title_suffixes() {
+        assert!(is_match("Radiohead", "Creep - Remastered 2011", "Radiohead", "Creep"));
+        assert!(is_match("Nirvana", "Come As You Are (Live)", "Nirvana", "Come As You Are"));
+    }
+
+    #[test]
+    fn tolerates_collaborator_lists() {
+        // Spotify joins every credited artist; the model names the primary one.
+        assert!(is_match("Sonic Youth, Kim Gordon", "Bull In The Heather", "Sonic Youth", "Bull In The Heather"));
+    }
+
+    // The whole point of the resolution pass: a plausible-but-wrong hit must not be accepted.
+    #[test]
+    fn rejects_a_different_track_by_the_right_artist() {
+        assert!(!is_match("Radiohead", "Karma Police", "Radiohead", "Creep"));
+    }
+
+    #[test]
+    fn rejects_the_right_title_by_the_wrong_artist() {
+        assert!(!is_match("Stone Temple Pilots", "Creep", "Radiohead", "Creep"));
+    }
+
+    #[test]
+    fn rejects_empty_fields() {
+        // An empty title would otherwise prefix-match everything.
+        assert!(!is_match("Radiohead", "Creep", "Radiohead", ""));
+        assert!(!is_match("", "Creep", "Radiohead", "Creep"));
+    }
 }
