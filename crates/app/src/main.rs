@@ -119,6 +119,16 @@ struct App {
     blurred: HashMap<String, (egui::TextureHandle, f32)>,
     /// Recency order of `blurred` keys — same bounding as `textures_order`.
     blurred_order: std::collections::VecDeque<String>,
+    /// Textures evicted from a cache, held until the next frame begins.
+    ///
+    /// Dropping a `TextureHandle` frees its egui texture id. Do that mid-frame and any paint
+    /// command already queued against that id refers to a texture that no longer exists — wgpu
+    /// rejects the submission and eframe panics with "Texture ... has been destroyed". Eviction
+    /// runs from `art`/`backdrop`, which are called *during* painting, so the old code's
+    /// assumption that the least-recent entry can't be on screen fails whenever one frame touches
+    /// more covers than the cache holds. Holding the handle until the next frame starts means the
+    /// free always lands between frames, where nothing references it.
+    retired: Vec<egui::TextureHandle>,
     /// The track whose "add to playlist" dialog is open, if any.
     add_to: Option<nocturne_api::Track>,
     /// ESRGAN-upscaled covers resident in VRAM, keyed by art url.
@@ -180,6 +190,7 @@ impl App {
             show_nowpane: true,
             // Full screen IS the app. Browsing is a detour you take and come back from.
             vibe: true,
+            retired: Vec::new(),
             blurred: HashMap::new(),
             blurred_order: Default::default(),
             add_to: None,
@@ -265,11 +276,12 @@ impl App {
         let tex = ctx.load_texture(url, color, egui::TextureOptions::LINEAR);
         self.textures.insert(url.to_string(), tex.clone());
         self.textures_order.push_back(url.to_string());
-        // Dropping the evicted handle frees its GPU texture. Least-recent goes first, and anything
-        // painted this frame was just touched — so nothing on screen is ever the one freed.
+        // Least-recent goes first, but the handle is retired rather than dropped — see `retired`.
         while self.textures_order.len() > TEX_CACHE_CAP {
             if let Some(old) = self.textures_order.pop_front() {
-                self.textures.remove(&old);
+                if let Some(t) = self.textures.remove(&old) {
+                    self.retired.push(t);
+                }
             }
         }
         Some(tex)
@@ -533,6 +545,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply(ctx);
         polish(ctx);
+        // Between frames: the previous frame is submitted and the next hasn't queued anything, so
+        // this is the one safe moment to actually free what was evicted while painting it.
+        self.retired.clear();
         // Keep the resident 8× covers in step with the queue, wherever the user just skipped to.
         self.hires_sync(ctx);
 
@@ -1430,7 +1445,9 @@ impl App {
         self.blurred_order.push_back(url.to_string());
         while self.blurred_order.len() > TEX_CACHE_CAP {
             if let Some(old) = self.blurred_order.pop_front() {
-                self.blurred.remove(&old);
+                if let Some((t, _)) = self.blurred.remove(&old) {
+                    self.retired.push(t);
+                }
             }
         }
         Some((tex, exposed))
